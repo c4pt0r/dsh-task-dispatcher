@@ -1,0 +1,135 @@
+{
+  "name": "dsh-task-dispatcher",
+  "version": "0.1.0",
+  "description": "Evaluator-gated task dispatch for DeepSeek Harness",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/c4pt0r/dsh-task-dispatcher.git"
+  },
+  "homepage": "https://github.com/c4pt0r/dsh-task-dispatcher#readme",
+  "bugs": {
+    "url": "https://github.com/c4pt0r/dsh-task-dispatcher/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "keywords": [
+    "deepseek-harness",
+    "task-dispatcher",
+    "distributed",
+    "postgresql",
+    "subagent",
+    "verification",
+    "plugin"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./dispatcher.js",
+    "./dispatcher": "./dispatcher.js",
+    "./distributed-store": "./distributed-store.js",
+    "./distributed-worker": "./distributed-worker.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bundle.cordis.patch.yml",
+    "dispatcher.js",
+    "distributed-store.js",
+    "distributed-worker.js",
+    "lib/client.js",
+    "lib/client.js.map",
+    "lib/package.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
+  "scripts": {
+    "bundle": "tsdown",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "oxlint --deny-warnings dispatcher.js dispatcher.test.js distributed-store.js distributed-store.test.js distributed-worker.js distributed-worker.test.js src/client tests/client tsdown.config.ts vitest.config.ts",
+    "publint": "publint",
+    "test:host": "node --test dispatcher.test.js distributed-store.test.js distributed-worker.test.js",
+    "test:client": "npm run bundle && vitest run",
+    "test": "npm run test:host && npm run test:client",
+    "prepublishOnly": "npm run bundle"
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "3.18.1",
+    "pg": "8.23.0",
+    "react": "^18.2.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-client-connection": "^0.0.1-rc.1 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-client-locale": "^0.0.1-rc.1 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-client-runtime": "^0.0.1-rc.1 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-client-ui-conversation": "^0.0.1-rc.1 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-client-ui-primitives": "^0.0.1-rc.1 || ^0.1.0-rc.5",
+    "@deepseek-ai/dsh-client-ui-slots": "^0.0.1-rc.1 || ^0.1.0-rc.5"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-connection": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-locale": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-runtime": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-conversation": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-primitives": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-client-ui-slots": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-client-connection": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-locale": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-runtime": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-conversation": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-primitives": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-client-ui-slots": "0.1.0-rc.6",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^24.10.1",
+    "@types/react": "~18.3.1",
+    "@types/react-dom": "~18.3.0",
+    "jsdom": "29.1.1",
+    "lightningcss": "^1.32.0",
+    "oxlint": "1.76.0",
+    "publint": "0.3.21",
+    "react-dom": "^18.2.0",
+    "tsdown": "^0.22.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./bundle.cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
+  }
+}

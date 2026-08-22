@@ -1,0 +1,56 @@
+# Installable DSH bundle: evaluator-gated task dispatch through isolated child
+# sessions. Acceptance is model-verified; it is not a proof or human approval.
+- insert:
+    - id: dsh-task-dispatcher
+      name: dsh-task-dispatcher
+      config:
+        defaultRunInBackground: true
+        maxConsecutiveFailures: 3
+        circuitCooldownMs: 300000
+        jobOutputLimitBytes: 131072
+        liveRoot: ""
+        stagingRoot: ""
+        lanes:
+          general-analysis:
+            name: General analysis task
+            description: Analyze a bounded task and verify the result independently without workspace mutation.
+            kind: general
+            transport: spawn
+            executor:
+              provider: deepseek-official
+              model: deepseek-v4-pro
+              maxTokens: 32000
+            verifier:
+              provider: deepseek-official
+              model: deepseek-v4-flash
+              maxTokens: 12000
+            planner:
+              provider: deepseek-official
+              model: deepseek-v4-flash
+              maxTokens: 12000
+            plannerTools:
+              - read
+              - glob
+              - grep
+            maxPlanSteps: 6
+            maxPlanPatches: 4
+            maxTotalChildRuns: 32
+            taskTimeoutMs: 3600000
+            retryOnRevise: false
+            maxAttempts: 1
+            childTimeoutMs: 900000
+            requiredCriteria:
+              - id: requirements
+                text: All explicit requirements are implemented.
+              - id: tests
+                text: Relevant tests pass, or the result gives a concrete reason they could not run.
+              - id: regression
+                text: No obvious regression was found in the affected behavior.
+            executorTools:
+              - read
+              - glob
+              - grep
+            verifierTools:
+              - read
+              - glob
+              - grep

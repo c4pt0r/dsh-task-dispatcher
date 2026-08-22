@@ -1,0 +1,744 @@
+# dsh-task-dispatcher
+
+An independent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that sends bounded work to isolated child Sessions and requires independent model verification. A lane can use the original executor-to-verifier pipeline or add a read-only planner that maintains a bounded, evaluator-gated master plan. Each configured lane owns every model route, tool allow-list, retry and planning budget, timeout, and mandatory acceptance criterion. Local execution remains the default; an opt-in distributed read-only mode leases complete tasks to remote DSH workers through PostgreSQL.
+
+The parent Session stays the control plane. Execution and verification run in child Sessions, so competing models never append concurrently to the same parent Session.
+
+## What it guarantees
+
+For every `dispatch_task` call, the plugin:
+
+1. Validates the task against a deployment-owned lane.
+2. Uses the original isolated executor-to-verifier pipeline when the lane has
+   no `planner` route.
+3. When a `planner` is configured, requires a structured initial plan, sends
+   that proposal to a separate plan-review child, and executes only an accepted
+   plan.
+4. Runs an executor and an independent verifier for exactly one plan step at a
+   time. Only the Host can mark that step complete.
+5. After a completed step, while pending work and patch budget remain, lets the
+   planner keep the remaining plan, report a blocker, or propose replacement of
+   only the pending suffix. Every proposed replacement receives another
+   independent plan review before the Host commits it.
+6. After all steps complete, runs a final global verifier against the immutable
+   original task and all original acceptance criteria.
+7. Accepts only when the applicable verifier returns exactly one result for
+   every criterion, every result is `pass`, and every pass has non-empty
+   evidence.
+8. Repeats an executor or permits final-review remediation only when deployment
+   policy explicitly enables `retryOnRevise` and the relevant attempt, patch,
+   child-run, and deadline budgets still permit it.
+
+An accepted result is **model-verified**. It is not a formal proof, a security certification, or human approval. The executor's own success claim is never sufficient for acceptance.
+
+Other safety properties include:
+
+- Root-only dispatch: subagents cannot recursively create dispatcher work.
+- For local lanes, one active task per overlapping workspace tree in the
+  current DSH process. Canonical parent/child paths conflict, and the
+  reservation is kept in process-global state so a plugin hot reload cannot
+  overlap an older task. Distributed v1 permits concurrent access only because
+  all admitted worker tools are read-only.
+- Host-generated task ids; a caller cannot choose them.
+- Host-owned master-plan identity, revision, status, evidence, and immutable
+  history. Planner children can propose typed data, but cannot mutate plan
+  state. A revision patch must match the current Host revision, and completed
+  steps form an immutable prefix that cannot be replaced; removed historical
+  step ids cannot be reused, and plan reviews reject proposals that repeat
+  completed effects.
+- Mandatory lane criteria cannot be removed or replaced by a tool call. A caller may only add stricter criteria with new ids.
+- Bounded task text, criteria, deliverables, attempts, plan size, plan patches,
+  total child runs, whole-task runtime, per-child runtime, output, cleanup, and
+  job output.
+- Child tool allow-lists. An empty verifier list creates a model-only verifier.
+- Planner and verifier tools are restricted to the built-in read-only set
+  (`read`, `read_image`, `glob`, and `grep`); planning and verification cannot
+  mutate the candidate.
+- Child start, result, timeout, cancellation, and cleanup failures become structured task failures.
+- If local child cleanup cannot be confirmed, the result sets
+  `workspaceQuarantined: true` and the process keeps that workspace reserved;
+  no replacement or hot-reloaded local dispatcher may start another task
+  there. A distributed cleanup failure is also non-accepted and asks operators
+  to replace or inspect that worker.
+- Unexpected pipeline exceptions are contained and observed instead of becoming unhandled Promise rejections.
+- For local lanes, a process-local per-lane circuit opens after repeated infrastructure errors and cools down before accepting more work.
+- Dispatch always requires the normal Harness **Allow once** approval.
+
+`spawn` is the recommended transport because the task specification is standalone. `fork` additionally gives a child the parent's completed history, but it does not include the currently executing dispatch tool call.
+
+## Execution modes and master plans
+
+Omitting `planner` preserves the original pipeline: one task-wide executor run
+produces structured evidence, then a separate verifier evaluates the complete
+task. `retryOnRevise` may repeat that executor up to `maxAttempts`; no master
+plan is created.
+
+When `planner` is configured, the pipeline is:
+
+```text
+initial planner -> independent plan review
+  -> step executor -> independent step verifier
+  -> keep plan | independently review and replace pending suffix
+  -> ...
+  -> final independent verifier over the original task
+```
+
+The initial plan must cover every original criterion and deliverable. The Host
+assigns the plan id, owns its monotonically increasing revision and append-only
+history, and is the only component allowed to change step status or record
+evidence. A planner patch is compare-and-set against the current revision. It
+may return `keep`, `blocked`, or `replace_pending`; it cannot edit the completed
+prefix. Removed historical step ids cannot be reused, and a replacement cannot
+weaken coverage of the immutable task.
+
+An accepted step becomes part of the immutable completed prefix before any
+replanning. Once no pending step remains, a final verifier must independently
+accept every original task criterion with evidence. If that verifier requests
+revision and retry policy allows it, the planner may propose bounded remediation
+steps in the still-available plan suffix; otherwise the task is rejected or
+blocked.
+
+Master-plan state is **process-local** to the process executing the task. It is
+included in the eventual task result for inspection, but this release has no
+durable phase or plan journal and cannot resume a plan, child run, budget, or
+pending suffix after that process restarts. A local task is therefore lost with
+its process. A distributed task envelope and its eventual terminal result are
+durable, but a worker failure causes the complete task pipeline to be leased
+and run again rather than resuming its interrupted plan.
+
+## Distributed read-only execution (v1)
+
+Distributed mode places a **whole task** on one worker. That worker creates a
+temporary local root Agent and runs the existing planner, executor, reviewer,
+and verifier pipeline there. Multiple tasks can be spread across worker
+processes and each worker can claim up to its configured `concurrency`; the
+steps of one task are not split across machines in this version.
+
+The origin Session remains the authorization and control boundary. The durable
+envelope contains the bounded task specification, selected lane, lane-policy
+digest, and an opaque `workspaceRef`. It does not transfer the origin's
+absolute workspace path, parent Agent object, abort signal, environment, or
+credentials. Each trusted worker maps that reference to its own existing
+absolute directory and uses its own configured models, credentials, sandbox,
+and Agent preset. Worker profiles must provide the Harness `agentPresets`
+service; an empty `workerAgentPreset` selects that service's default preset.
+
+### PostgreSQL and process roles
+
+Set the connection string in the environment of every participating process.
+`databaseUrlEnv` names the variable; it is not itself a URL:
+
+```sh
+export DSH_DISPATCHER_DATABASE_URL='postgresql://dispatcher:REDACTED@db.example/dispatcher?sslmode=require'
+```
+
+On startup the plugin initializes a versioned `dispatcher_tasks` schema. A
+PostgreSQL advisory lock serializes the one-time migration; steady-state starts
+verify the current version without repeating the old `ALTER`/`DROP` operations.
+Migration statements have a separate five-minute timeout while ordinary ledger
+queries remain bounded to five seconds. The database role therefore needs DDL
+permission during initialization and read/write permission afterwards. Keep the
+URL out of YAML and source control, use deployment-managed TLS, restrict network
+access, and give the role access only to the dispatcher database/schema.
+
+Use one of these roles:
+
+- `coordinator` enqueues tasks and registers `dispatch_status` and
+  `dispatch_cancel`, but does not claim work.
+- `worker` claims tasks from its configured pools, but does not expose the
+  durable status/cancel tools.
+- `hybrid` does both in one process. It is convenient for a single-node
+  deployment that can later add remote workers.
+- `disabled` is the default and leaves every lane local.
+
+The coordinator and every worker for a pool must configure the distributed
+lane identically. Workers compare the envelope's policy digest with their local
+lane before execution and fail closed on drift. Both `scopeId` and pool are
+scheduling and trust boundaries: a worker claims only rows matching its exact
+scope and one of its configured pools. Keep unrelated deployments in distinct
+scopes, and do not mix incompatible lane policies within one scope and pool.
+
+Coordinator example:
+
+```yaml
+- id: dsh-task-dispatcher
+  name: dsh-task-dispatcher
+  config:
+    distribution:
+      role: coordinator
+      databaseUrlEnv: DSH_DISPATCHER_DATABASE_URL
+      scopeId: production
+      maxDeliveryAttempts: 3
+    lanes:
+      remote-analysis:
+        kind: general
+        transport: spawn
+        execution:
+          mode: distributed
+          pool: analysis-production
+          workspaceRef: project-main
+        executor: { provider: deepseek-official, model: deepseek-v4-pro, maxTokens: 32000 }
+        verifier: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+        requiredCriteria:
+          - { id: requirements, text: All explicit requirements are addressed. }
+          - { id: evidence, text: Every conclusion includes concrete repository evidence. }
+        executorTools: [read, glob, grep]
+        verifierTools: [read, glob, grep]
+```
+
+Worker example. The complete `remote-analysis` lane must remain identical to
+the coordinator example; only the process-level `distribution` settings differ:
+
+```yaml
+- id: dsh-task-dispatcher
+  name: dsh-task-dispatcher
+  config:
+    distribution:
+      role: worker
+      databaseUrlEnv: DSH_DISPATCHER_DATABASE_URL
+      scopeId: production
+      workerId: analysis-west-01
+      pools: [analysis-production]
+      workspaceMappings:
+        project-main: /srv/workspaces/project-main
+      concurrency: 2
+      leaseMs: 45000
+      heartbeatMs: 10000
+      pollMs: 1000
+      maxDeliveryAttempts: 3
+    lanes:
+      remote-analysis:
+        kind: general
+        transport: spawn
+        execution:
+          mode: distributed
+          pool: analysis-production
+          workspaceRef: project-main
+        executor: { provider: deepseek-official, model: deepseek-v4-pro, maxTokens: 32000 }
+        verifier: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+        requiredCriteria:
+          - { id: requirements, text: All explicit requirements are addressed. }
+          - { id: evidence, text: Every conclusion includes concrete repository evidence. }
+        executorTools: [read, glob, grep]
+        verifierTools: [read, glob, grep]
+```
+
+Hybrid example uses the same lane and combines the two capabilities:
+
+```yaml
+- id: dsh-task-dispatcher
+  name: dsh-task-dispatcher
+  config:
+    distribution:
+      role: hybrid
+      databaseUrlEnv: DSH_DISPATCHER_DATABASE_URL
+      scopeId: development
+      workerId: dev-node-01
+      pools: [analysis-development]
+      workspaceMappings:
+        project-main: /Users/example/work/project
+      concurrency: 1
+    lanes:
+      remote-analysis:
+        kind: general
+        transport: spawn
+        execution: { mode: distributed, pool: analysis-development, workspaceRef: project-main }
+        executor: { provider: deepseek-official, model: deepseek-v4-pro, maxTokens: 32000 }
+        verifier: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+        requiredCriteria:
+          - { id: requirements, text: All explicit requirements are addressed. }
+          - { id: evidence, text: Every conclusion includes concrete repository evidence. }
+        executorTools: [read, glob, grep]
+        verifierTools: [read, glob, grep]
+```
+
+`workspaceMappings` is required on `worker` and `hybrid` processes for every
+distributed lane they may execute. Different workers may map the same logical
+reference to different local absolute paths, but those directories should
+contain the same intended read-only candidate. The `workspaceRef` is fixed by
+deployment policy and cannot be supplied or changed by the model.
+
+### Admission, delivery, leases, and cancellation
+
+Distributed v1 deliberately accepts only lanes that are all of the following:
+
+- `kind: general` (never `self-improvement`);
+- `transport: spawn`;
+- `execution.mode: distributed`; and
+- limited to the built-in read-only tools `read`, `read_image`, `glob`, and
+  `grep` across planner, executor, and verifier allow-lists.
+
+A distributed dispatch is always background. Set `run_in_background: true`, or
+omit it when `defaultRunInBackground` is true. An explicit false value is
+rejected. Unlike a local background task, it does not create a Harness Job or
+return a `jobId`; `dispatch_task` returns a durable `taskId` and the initial
+queue state. Inspect it from the exact origin Session:
+
+```json
+{ "task_id": "THE_DURABLE_TASK_ID" }
+```
+
+with `dispatch_status`, or request cancellation with `dispatch_cancel`:
+
+```json
+{ "task_id": "THE_DURABLE_TASK_ID", "reason": "No longer needed" }
+```
+
+Status is owner-fenced by `scopeId` and origin Session id. Cancellation has the
+normal Harness approval gate. A queued task is closed immediately; a running
+task observes the request through its next successful heartbeat and aborts its
+local pipeline. Cancellation is cooperative, so external process supervision
+is still required for a wedged runtime.
+
+Delivery is **at least once**, not exactly once. Claims use PostgreSQL row locks
+with `SKIP LOCKED`; a worker renews a bounded lease, and a crashed or partitioned
+worker's task becomes claimable after expiry until `maxDeliveryAttempts` is
+exhausted. Each claim increments a monotonic lease generation and receives a
+new random bearer token whose hash—not the token—is stored in PostgreSQL. A
+heartbeat or terminal write must match the current worker, generation, and
+token, so a stale worker cannot publish over a newer lease. Replaying the same
+completion for the current lease is idempotent; a conflicting completion fails
+closed.
+
+`heartbeatMs` must be no more than one third of `leaseMs`. Claim and heartbeat
+responses carry the PostgreSQL clock snapshot used for their lease. The worker
+maps the server-owned remaining duration onto its local monotonic clock and
+conservatively charges request latency, so ordinary node clock skew cannot
+extend its authority. If renewal does not finish, the worker requests pipeline
+abortion one heartbeat interval before lease expiry and refuses to publish from
+that claim; PostgreSQL's clock ultimately fences heartbeats and completion. The
+immutable task deadline is created from the database clock when the coordinator
+enqueues the task; leases are clamped to it, the worker aborts at it, and the
+store rejects late completion. These mechanisms prevent stale acceptance, but
+they cannot undo model calls already made before a crash or force an
+uncooperative child to exit. That is why v1 is read-only, needs an external
+supervisor, and makes no exactly-once side-effect guarantee.
+
+### Restart and availability semantics
+
+- A coordinator restart does not delete an already committed task. Workers can
+  continue it, and the terminal result remains in PostgreSQL. The in-process
+  monitor and Web snapshot do not resume automatically; `dispatch_status`
+  remains owner-fenced to the same `scopeId` and exact origin Session id.
+- A worker restart does not resume its Agent, child run, or master plan. After
+  the old lease expires, an eligible worker starts the complete pipeline again
+  under a new generation, subject to the absolute deadline and delivery-attempt
+  limit.
+- If PostgreSQL is unavailable during startup, coordinator and worker roles use
+  bounded exponential backoff and recover without a Harness restart. Running
+  workers also retry polling, and task monitors retry transient reads. A worker
+  that cannot renew an active lease aborts before its safety boundary and cannot
+  commit a result. Coordinator enqueue, status, and cancellation calls fail
+  closed while the database is unreachable and work again after recovery.
+- Plugin disposal stops local claim loops and monitors; it does not cancel or
+  delete durable tasks.
+
+Run every coordinator and worker under an external supervisor with bounded
+restart backoff, health checks, out-of-process logs, and a last-known-good
+release. PostgreSQL durability is the queue's failure boundary, so configure
+backups and database high availability appropriate to the deployment. Add
+workers with distinct stable `workerId` values, identical lane policy, access
+to the intended pool and local workspace mapping, and the model credentials
+needed on that node.
+
+## Web execution view
+
+The bundle includes a Web client module. Each conversation header gets a
+compact summary such as `Plan 2/5 · 1 active Agent`. The summary prioritizes
+tasks that are still running: it aggregates only their plan steps and counts
+active child Agents (not distinct model routes). Before a local master plan
+exists, it shows the task's current phase, such as `Creating initial plan`,
+instead of the misleading `Plan 0/0`. When no task is running, it shows only
+the newest terminal task's status and plan progress rather than accumulating
+history. Open it to see:
+
+- every recent or active dispatcher task in that exact Session;
+- for a durable task, its pool, queued/running/terminal placement state, remote
+  node id, delivery count, lease generation and expiry, and cancellation flag;
+- for a local task, the current master-plan revision and completed-step count;
+- for a local task, each step's prerequisite, displayed as a vertical
+  dependency chain;
+- for a local task, the planner, executor, reviewer, or verifier attached to
+  each step, plus the child Agent id and selected provider/model; and
+- reconnecting, blocked, rejected, cancelled, and error states with both text
+  and color-independent status markers.
+
+Distributed v1 deliberately does not guess. While a remote task is running,
+the durable ledger proves its task state, pool, node, claim generation, lease,
+delivery count, and cancellation request, but it does not persist the worker's
+current planner/executor/verifier phase, child Agent id, selected model, or live
+master-plan snapshot. The card therefore says `Running remotely (phase
+unreported)` and shows no invented Agent. The validated terminal result can
+include the final master plan; a durable phase-and-plan progress journal is a
+future protocol extension.
+
+The current planner contract is linear: the Host executes the first pending
+step, so each step depends on the preceding step. The wire format uses
+`dependsOn`, allowing a future DAG scheduler to expose richer dependencies
+without changing the view contract. The UI does not invent parallelism that
+the runtime does not support.
+
+The Host publishes bounded, session-filtered snapshots through a loopback-only
+RPC channel. The browser takes a baseline snapshot and then uses
+cancellation-aware long polls. It ignores stale replies, accepts a fresh
+baseline after a Host restart, and keeps the last valid view while reconnecting.
+Visualization, listener, decoding, and transport failures are contained and
+cannot alter task execution or acceptance. Snapshots intentionally omit task
+prompts, workspace paths, criterion evidence, and other large or sensitive
+payloads. The PostgreSQL task record is durable; this Web read-model is not, so
+a coordinator restart clears the live card. Use `dispatch_status` from the
+exact origin Session when the durable ledger is the source of truth.
+
+## Install locally
+
+Install and test this project, then add its absolute path to a DSH profile that already provides the standard agents, jobs, subagents, and tools services:
+
+```sh
+cd /path/to/dsh-task-dispatcher
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm test
+pnpm run bundle
+
+cd /path/to/deepseek-harness
+pnpm dsh plugin --profile web add /path/to/dsh-task-dispatcher
+pnpm dsh --profile web --dump-config
+```
+
+The dumped composition should contain a `dsh-task-dispatcher` row whose plugin
+name is the package root, `dsh-task-dispatcher`. That root row is required for
+Harness to discover and serve `lib/client.js`; the compatibility export
+`dsh-task-dispatcher/dispatcher` remains importable but must not be used as the
+Cordis row name.
+
+Harness supplies the optional Cordis and Web-client peer modules named by the
+bundle. The repository commits its generated `lib/client.js` artifacts, so a
+Git or file dependency does not need a compiler or a globally installed pnpm
+during installation. Maintainers must run the bundle command and tests before committing;
+`npm publish` also rebuilds the client through the package's
+`prepublishOnly` gate. Run the documented bundle command before a local `npm pack`.
+
+The bundled `general-analysis` lane is ready for the local `dsh-ds4` provider mapping, enables the master-plan pipeline, and is intentionally read-only. The checked-in bundle deliberately leaves `distribution` disabled and this lane in the default local execution mode:
+
+- planner: `deepseek-official/deepseek-v4-flash` with 12,000 tokens
+- executor: `deepseek-official/deepseek-v4-pro`
+- verifier: `deepseek-official/deepseek-v4-flash`
+- planner tools: `read`, `glob`, `grep`
+- executor tools: `read`, `glob`, `grep`
+- verifier tools: `read`, `glob`, `grep`
+- plan budget: 6 steps, 4 accepted pending-suffix replacements, and 32 total child runs
+- deadlines: 1 hour for the complete task and 15 minutes for each child
+- required criteria: `requirements`, `tests`, `regression`
+
+The configured tool names are an upper bound. Child execution still follows the Harness sandbox and delegated-child approval policy; a child cannot escalate its own permissions.
+
+## Dispatch a task
+
+Ask naturally from an exact live root Session, for example:
+
+```text
+Use the general-analysis dispatcher lane to review the audit-log pagination.
+Identify concrete implementation gaps and focused tests. Also require the
+acceptance criterion "empty-page": verify that requesting a page after the
+last result returns an empty list.
+Run it in the background.
+```
+
+The corresponding tool input is:
+
+```json
+{
+  "lane": "general-analysis",
+  "title": "Audit log pagination review",
+  "objective": "Review pagination for the audit log and identify concrete gaps and tests.",
+  "context": "Preserve the existing response shape.",
+  "deliverables": [
+    { "id": "implementation", "description": "Pagination implementation" },
+    { "id": "tests", "description": "Focused regression tests" }
+  ],
+  "acceptance_criteria": [
+    { "id": "empty-page", "text": "A page after the final result returns an empty list." }
+  ],
+  "run_in_background": true
+}
+```
+
+Only `lane`, `title`, and `objective` are required. `run_in_background` defaults to the deployment's `defaultRunInBackground`, which is `true` in the bundled profile.
+
+Local foreground results have `kind: "foreground"` and a task status of `accepted`, `rejected`, `blocked`, `cancelled`, or `error`. They include `failureClass` (`none`, `task`, or `infrastructure`), executor and verifier child run ids, and reports. Planner-enabled results additionally include planner runs, plan-review runs, and the Host-owned `masterPlan` with its revision and history. A local background dispatch returns a `taskId` and `jobId` immediately; use the standard `job_output`, `job_list`, and `job_kill` tools to inspect or cancel it. A distributed dispatch instead returns `kind: "distributed"`, a durable `taskId`, and `queued`, `running`, or `terminal` state; use `dispatch_status` and `dispatch_cancel` rather than Jobs.
+
+At the Jobs layer, a finished `rejected` or `blocked` task is still a completed job—the task's JSON output contains the semantic result. Only dispatcher infrastructure errors fail the job, and cancellation kills it.
+
+## Configure lanes
+
+Lanes are deployment policy, not model-controlled input. The model calling `dispatch_task` selects only one of the configured lane ids; it cannot supply a provider, model, token budget, tools, timeout, or retry count.
+
+The complete plugin-level settings are:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `lanes` | `{}` | Up to 16 deployment-owned lane definitions. |
+| `defaultRunInBackground` | `true` | Default execution mode when the tool omits `run_in_background`. |
+| `maxConsecutiveFailures` | `3` | Infrastructure errors before a local lane's process-local circuit opens. |
+| `circuitCooldownMs` | `300000` | How long an open circuit rejects new work. |
+| `jobOutputLimitBytes` | `131072` | Maximum background Job output retained by Harness. |
+| `liveRoot` | empty | Absolute live checkout root required by self-improvement lanes. |
+| `stagingRoot` | empty | Absolute staging root required by self-improvement lanes. |
+| `distribution` | `{ role: disabled }` | PostgreSQL whole-task distribution settings; see the table below. |
+
+Distribution settings are:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `role` | `disabled` | `disabled`, `coordinator`, `worker`, or `hybrid`. |
+| `databaseUrlEnv` | `DSH_DISPATCHER_DATABASE_URL` | Name of the environment variable containing the PostgreSQL connection string. |
+| `scopeId` | `default` | Required tenant/deployment boundary for enqueue idempotency, origin-Session ownership, and worker claims. |
+| `workerId` | empty | Stable node identity published with leases; an empty value generates a new id for that process. |
+| `workerAgentPreset` | empty | Agent preset for the worker's temporary root; empty selects `agentPresets.defaultId`. |
+| `pools` | `[default]` | Pools a worker or hybrid process may claim; 1-64 character deployment ids, up to 16 entries. |
+| `workspaceMappings` | `{}` | Map from immutable logical `workspaceRef` values to existing absolute paths on this worker. |
+| `concurrency` | `1` | Concurrent whole-task claim loops in one worker, from 1 through 16. |
+| `leaseMs` | `45000` | Lease duration, from 15 seconds through 5 minutes. |
+| `heartbeatMs` | `10000` | Renewal interval, from 1 through 60 seconds and at most one third of `leaseMs`. |
+| `pollMs` | `1000` | Empty-queue and transient-failure polling interval, from 100 ms through 30 seconds. |
+| `maxDeliveryAttempts` | `3` | Maximum whole-task claims after enqueue or lease loss, from 1 through 10. This is separate from model revision attempts. |
+
+Each lane supports:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `name` | empty | Human-readable name. |
+| `description` | empty | Description exposed to the model in the tool definition. |
+| `kind` | `general` | `general` or guarded `self-improvement`. |
+| `transport` | `spawn` | `spawn` or `fork` child-session transport. |
+| `execution` | `{ mode: local, pool: default, workspaceRef: "" }` | Local execution, or a distributed pool plus immutable worker workspace reference. |
+| `executor` | required | `{ provider, model, maxTokens }` executor route. |
+| `verifier` | required | `{ provider, model, maxTokens }` verifier route. |
+| `planner` | omitted | Optional `{ provider, model, maxTokens }` route. Omit it to retain the original executor-to-verifier pipeline. |
+| `plannerTools` | `[]` | Planner allow-list; only `read`, `read_image`, `glob`, and `grep` are accepted. Empty means model-only. |
+| `maxPlanSteps` | `6` | Maximum completed-plus-pending steps in a planner-managed plan; configurable from 1 through 8. |
+| `maxPlanPatches` | `4` | Maximum committed `replace_pending` revisions; configurable from 0 through 8. |
+| `maxTotalChildRuns` | `32` | Hard aggregate budget for planner, plan-review, executor, step-verifier, and final-verifier children; configurable from 5 through 32. |
+| `taskTimeoutMs` | `3600000` | Planner-enabled whole-pipeline deadline, from 1 second through 6 hours; legacy lanes retain their per-child deadlines. |
+| `retryOnRevise` | `false` | Permit a verifier `revise` decision to run the executor again. Enable only for idempotent work. |
+| `maxAttempts` | `1` | Executor attempts, from 1 through 3; used only when retry is enabled. |
+| `childTimeoutMs` | `900000` | Per planner, reviewer, executor, or verifier child deadline, from 1 second through 1 hour. |
+| `requiredCriteria` | required, non-empty | Immutable lane criteria with unique ids. |
+| `executorTools` | no tools when omitted | Explicit executor tool allow-list. |
+| `verifierTools` | `[]` | Explicit verifier tool allow-list; empty means model-only. |
+
+Provider and model names must match routes available in the installed Harness profile. A lane should normally use different executor and verifier models, or at minimum separate child runs, to reduce correlated self-review.
+
+Every configured route accepts 1 through 1,000,000 `maxTokens` and defaults to
+32,000 when omitted. `maxTotalChildRuns` applies only to planner-enabled lanes;
+each planner, plan reviewer, executor, step verifier, and final verifier start
+consumes one slot. Budget exhaustion fails closed with a non-accepted result.
+
+Any lane whose executor can mutate the workspace must configure `liveRoot`;
+otherwise plugin policy validation fails closed. Revision retries are disabled
+by default because a second executor run can repeat shell, network, publish, or
+other external side effects. Enable `retryOnRevise` only when the complete task
+is idempotent, not merely because file edits are usually repeatable.
+
+Every mutating lane also requires the parent Session to use
+`workspace-write`, with the sandbox workspace root resolving exactly to the
+Session workspace. `danger-full-access`, a broader sandbox root, and a missing
+workspace all fail before a child is created. This protects filesystem scope;
+it is not process isolation for commands, signals, network access, or resource
+exhaustion.
+
+## Safe self-improvement
+
+The plugin can evaluate a Harness improvement candidate, but it deliberately cannot rewrite or deploy the live Harness that is currently running it. Self-improvement is a staging-only capability, not hot self-modification.
+
+Create two existing, disjoint absolute roots—for example a live checkout and a separate staging worktree—and configure a dedicated lane:
+
+```yaml
+- id: dsh-task-dispatcher
+  config:
+    liveRoot: /srv/dsh/live
+    stagingRoot: /srv/dsh/staging
+    lanes:
+      harness-improvement:
+        name: Harness improvement candidate
+        description: Change and verify Harness only in the staging worktree.
+        kind: self-improvement
+        transport: spawn
+        executor:
+          provider: deepseek-official
+          model: deepseek-v4-pro
+          maxTokens: 32000
+        verifier:
+          provider: deepseek-official
+          model: deepseek-v4-flash
+          maxTokens: 12000
+        retryOnRevise: false
+        maxAttempts: 1
+        childTimeoutMs: 900000
+        requiredCriteria:
+          - id: requirements
+            text: The candidate implements the approved improvement specification.
+          - id: tests
+            text: The staging test and health-check evidence passes.
+          - id: rollback
+            text: The candidate preserves a tested rollback path to last-known-good.
+        executorTools: [read, write, edit, glob, grep, bash]
+        verifierTools: [read, glob, grep]
+```
+
+At dispatch time, the exact parent Session's `cwd` must already exist and resolve under `stagingRoot`. The Session must use the `workspace-write` sandbox, and its resolved sandbox root must equal that staging workspace. Self-improvement is always a background task. The plugin resolves the existing workspace and roots, rejects a workspace outside staging or also inside `liveRoot`, and validates configured path nesting. The model cannot supply a different workspace. The executor prompt also marks live restart, signalling, modification, and deployment as forbidden.
+
+Canonical path protection is bidirectional: neither the task workspace nor
+`stagingRoot` may contain `liveRoot`, and neither may be contained by it.
+Symlink aliases are resolved before comparison. Because Harness
+`workspace-write` also grants platform temporary directories, a mutating lane
+rejects any `liveRoot` located under `/tmp` or `os.tmpdir()`. The exact sandbox
+policy is rechecked before every executor attempt, so a revision cannot inherit
+a policy broadened while a background task was running.
+
+When `liveRoot` is configured, the protection also applies to ordinary lanes:
+any lane whose executor allow-list contains a capability other than
+`read`, `read_image`, `glob`, or `grep` is refused when the Session workspace
+resolves inside `liveRoot`. This prevents relabelling a live self-edit as a
+general task.
+
+A safe continuous-improvement system should keep these stages separate:
+
+```text
+feedback/specification
+  -> staging-only dispatcher task
+  -> independent model verification
+  -> isolated tests and canary health checks
+  -> human or external promotion controller
+  -> atomic activation, with last-known-good rollback
+```
+
+This plugin implements staging dispatch and model verification. A configured executor can run staging tests with its allowed tools, but scheduling feedback, provisioning an isolated worker, canarying, promotion, rollback, and health monitoring belong to an external control plane. Never point a self-improvement lane at the running checkout, and never load unverified candidate code into the current Host process.
+
+## Availability and failure boundary
+
+“The Harness must never die” needs two different guarantees:
+
+### Task-level logical isolation
+
+This plugin is fail-closed at its boundary. Invalid tool inputs, an unavailable model, refusal, token exhaustion, child timeout, malformed structured output, failed cleanup, Job registration failure, cancellation, and unexpected pipeline exceptions return a bounded non-accepted result. They do not authorize a change and are not intentionally allowed to escape as unhandled rejections.
+
+The exported Loader schema is deliberately permissive so a bad dispatcher
+policy reaches the plugin's containment boundary instead of aborting the whole
+plugin tree. The plugin then logs the validation error, drops the requested
+lanes, and exposes only a repair-required fallback policy. Invalid YAML syntax,
+missing core services, or faults elsewhere in the composition can still fail
+before this plugin runs; validate composition with `--dump-config` before
+activating it.
+
+Executor and verifier children are separate Sessions but currently run in the same Node process. This is logical isolation, not an operating-system process boundary. A blocking native call, event-loop deadlock, OOM, runtime crash, `SIGKILL`, kernel failure, power loss, or machine loss cannot be contained by JavaScript in the same process.
+
+### Process- and machine-level availability
+
+Run DSH under an external supervisor such as systemd, launchd, Docker/Kubernetes, or another service manager with:
+
+- automatic restart and bounded backoff;
+- startup health/readiness checks;
+- a last-known-good immutable release;
+- atomic activation and automatic rollback after failed health checks;
+- logs and alerts outside the DSH process;
+- for machine-failure coverage, scheduling on another machine or a replicated control plane.
+
+The supervisor must not accept a newly generated candidate as the restart target until isolated tests and health checks pass. For high-risk self-improvement, use a separate OS process or container with a kill deadline and process-tree cleanup instead of relying only on same-process child Sessions.
+
+Local background Jobs, active master plans, workspace locks, child-run budgets,
+and circuit state are **process-local**. Locks and circuits survive plugin hot
+reload inside the same process, but none of those objects resumes after a DSH
+process restart. Distributed mode adds a durable PostgreSQL task envelope,
+lease, cancellation flag, and terminal result; it does not add a durable
+planner checkpoint or resume an interrupted child. Consequently a reclaimed
+task starts its complete read-only pipeline again.
+
+The Web read-model is also process-local. It retains every active task plus a
+bounded recent terminal history, and resets to a fresh baseline after a Host
+restart. It is an operational view of placement and leases, not the PostgreSQL
+recovery ledger.
+
+A local cleanup failure is treated more conservatively than an ordinary task
+error: the workspace lock is quarantined for the remainder of the process
+because the child may still be alive. This also applies when cancellation or a
+deadline wins before child startup finishes: a late child can still be
+published. The local background Job is reported as `failed`, not `killed`, and
+its detail includes `workspaceQuarantined: true`. A distributed worker also
+publishes cleanup uncertainty as an infrastructure error with
+`workspaceQuarantined: true`; v1 permits only read-only tasks, but the worker
+process should still be inspected or replaced. Restart DSH from the
+last-known-good release before dispatching more work there. The local lock
+remains conservative even if a late cleanup subsequently appears to succeed;
+the plugin never guesses that an uncertain child is gone.
+
+These layers make task failures non-fatal and let a supervisor recover process or host failures. No in-process plugin can truthfully guarantee survival under every possible failure.
+
+## Operational limits
+
+- At most 16 lanes per plugin instance; lane ids and criterion, deliverable,
+  and step ids are 1-64 characters in the supported id syntax.
+- Task input is capped at 200 title characters, 16,384 objective characters,
+  32,768 context characters, and 16 deliverables of at most 4,000 description
+  characters each.
+- At most 24 total task criteria, 2,000 characters per criterion, and 24,000
+  criterion characters in aggregate.
+- Each child tool allow-list contains at most 64 names. Planner and verifier
+  lists are further limited to `read`, `read_image`, `glob`, and `grep`.
+- Route token budgets are 1-1,000,000 tokens. Executor attempts are 1-3.
+- Planner-enabled plans contain 1-8 completed-plus-pending steps, with 1-12
+  acceptance criteria per step and at most twice `maxPlanSteps` distinct step
+  ids over the plan's lifetime. A plan summary is capped at 2,000 characters;
+  step titles at 200, step objectives at 4,000, each step criterion at 2,000,
+  and their combined plan text at 32,000 characters.
+- Accepted pending-suffix replacements are capped at 0-8. All child starts in
+  a planner-enabled task share a hard configurable budget of 5-32; the bundled
+  lane uses the hard maximum, 32. Patch rationale is capped at 4,000 characters
+  and a plan review can report at most 8 issues.
+- `taskTimeoutMs` is 1 second through 6 hours. `childTimeoutMs` is 1 second
+  through 1 hour and applies separately to every planner, reviewer, executor,
+  and verifier child.
+- Structured child reports and plan-review reports are bounded to 64,000
+  serialized characters; background Job output is configurable from 4,096
+  through 1,048,576 bytes.
+- Circuit policy allows 1-20 consecutive infrastructure failures and a cooldown
+  from 1 second through 24 hours.
+- One active local task per resolved workspace in one DSH process, including
+  across plugin hot reload. Distributed workers may overlap only read access.
+- Circuits, writable-workspace locks, active Jobs, child runs, and master-plan
+  checkpoints are not distributed across DSH processes. Distributed v1 is
+  read-only and coordinates only whole-task ownership and terminal publication.
+- A distributed envelope is capped at 131,072 serialized characters. A worker
+  may subscribe to at most 16 pools and execute 1-16 whole tasks concurrently;
+  delivery is capped at 1-10 claims per task.
+- Terminal PostgreSQL rows are durable and are not automatically pruned by the
+  plugin. Apply an operator-owned retention or archival policy only after the
+  corresponding Session no longer needs status lookup.
+- The Web read-model retains at most 20 recent terminal tasks per Session and
+  200 globally for one hour; active tasks are never evicted.
+- One coordinator process live-monitors at most 32 distributed tasks. Tasks
+  above that live-view limit remain durable and owner-queryable with
+  `dispatch_status`; the limit prevents a database outage from creating an
+  unbounded set of polling loops.
+- Web long polling is bounded to 8 outstanding watches per Session and 256 per
+  DSH process. Capacity, cancellation, timeout, and hot-reload paths release
+  their reservations; a malformed retained task is discarded in isolation
+  instead of blanking the rest of the Session view.
+
+Do not run multiple writable dispatcher processes against the same workspace unless an external scheduler provides a distributed lease.
+
+## Test and package
+
+```sh
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm lint
+pnpm test
+pnpm run bundle
+pnpm run publint
+pnpm pack --dry-run
+```
+
+## License
+
+[MIT](./LICENSE)
