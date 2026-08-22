@@ -43,7 +43,9 @@ describe('built Web client bundle', () => {
       'react',
       'react/jsx-runtime',
     ])
-    expect(document.querySelectorAll('style[data-plugin="dsh-task-dispatcher"]')).toHaveLength(1)
+    expect(document.querySelectorAll('style[data-plugin="dsh-task-dispatcher"]')).toHaveLength(2)
+    expect(document.querySelectorAll('style[data-plugin-css="dsh-task-dispatcher/TaskDispatcherAction.module.css"]')).toHaveLength(1)
+    expect(document.querySelectorAll('style[data-plugin-css="dsh-task-dispatcher/TaskDispatcherSettingsTab.module.css"]')).toHaveLength(1)
   })
 
   it('keeps generated code and source maps independent of the checkout path', () => {
@@ -55,7 +57,11 @@ describe('built Web client bundle', () => {
     expect(code).not.toContain(projectRoot)
     expect(sourceMapText).not.toContain(projectRoot)
     expect(sourceMap.sources).toEqual([
+      '../src/client/config-types.ts',
+      '../src/client/config-decode.ts',
+      '../src/client/config-controller.ts',
       '../src/client/TaskDispatcherAction.tsx',
+      '../src/client/TaskDispatcherSettingsTab.tsx',
       '../src/client/locales.ts',
       '../src/client/types.ts',
       '../src/client/decode.ts',
@@ -66,5 +72,8 @@ describe('built Web client bundle', () => {
     const cssSource = resolve(projectRoot, 'src/client/TaskDispatcherAction.module.css')
     const stableCssId = relative(projectRoot, cssSource).split(sep).join('/')
     expect(code).toContain(`dsh-task-dispatcher-css:${stableCssId}.mjs`)
+    const settingsCssSource = resolve(projectRoot, 'src/client/TaskDispatcherSettingsTab.module.css')
+    const stableSettingsCssId = relative(projectRoot, settingsCssSource).split(sep).join('/')
+    expect(code).toContain(`dsh-task-dispatcher-css:${stableSettingsCssId}.mjs`)
   })
 })

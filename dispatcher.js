@@ -10,7 +10,7 @@ import { DistributedWorker } from './distributed-worker.js'
 export const name = 'dsh-task-dispatcher'
 
 /** Host-plane services used by the dispatcher. */
-export const inject = ['agents', 'jobs', 'sandboxPolicy', 'subagents', 'tools']
+export const inject = ['agents', 'jobs', 'sandboxPolicy', 'settings', 'subagents', 'tools']
 
 /** Model-facing entry point. */
 export const TOOL_NAME = 'dispatch_task'
@@ -58,6 +58,11 @@ const DISTRIBUTED_MAX_MONITORS = 32
 export const TASK_DISPATCHER_TELEMETRY_PROTOCOL_VERSION = 1
 export const TASK_DISPATCHER_RPC_CHANNEL = '/task-dispatcher'
 
+/** Restart-scoped policy configuration uses its own loopback-only RPC. */
+export const TASK_DISPATCHER_CONFIG_RPC_CHANNEL = '/task-dispatcher-config'
+export const TASK_DISPATCHER_SETTINGS_NAMESPACE = 'dsh-task-dispatcher'
+export const TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION = 1
+
 const TELEMETRY_MAX_TERMINAL_TASKS_PER_SESSION = 20
 const TELEMETRY_MAX_TERMINAL_TASKS_GLOBAL = 200
 const TELEMETRY_TERMINAL_TTL_MS = 60 * 60 * 1_000
@@ -66,6 +71,8 @@ const TELEMETRY_MAX_WATCHES_PER_SESSION = 8
 const TELEMETRY_MAX_WATCHES_GLOBAL = 256
 const TELEMETRY_MAX_SESSION_ID_LENGTH = 256
 const TELEMETRY_MAX_ERROR_LENGTH = 2_000
+const CONFIG_RPC_MAX_BYTES = 1_048_576
+const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u
 
 const Route = z.object({
   provider: z.string().max(128).required(),
@@ -322,6 +329,9 @@ export function validateDispatcherConfig(config) {
   }
   const distribution = config.distribution
   trimmed(distribution.databaseUrlEnv, 'dsh-task-dispatcher.distribution.databaseUrlEnv')
+  if (!ENV_NAME_PATTERN.test(distribution.databaseUrlEnv)) {
+    throw new TypeError('dsh-task-dispatcher.distribution.databaseUrlEnv must be an environment variable name')
+  }
   trimmed(distribution.scopeId, 'dsh-task-dispatcher.distribution.scopeId')
   if (distribution.workerId !== '') trimmed(distribution.workerId, 'dsh-task-dispatcher.distribution.workerId')
   if (distribution.workerAgentPreset !== '') {
@@ -430,8 +440,320 @@ export function distributedTaskTimeoutMs(lane) {
 /** Resolve schema defaults for direct callers and tests. */
 export function resolveDispatcherConfig(value = {}) {
   const config = PolicyConfig(value)
+  assertExactDispatcherConfig(config)
   validateDispatcherConfig(config)
   return config
+}
+
+const POLICY_CONFIG_KEYS = new Set([
+  'lanes', 'defaultRunInBackground', 'maxConsecutiveFailures', 'circuitCooldownMs',
+  'jobOutputLimitBytes', 'liveRoot', 'stagingRoot', 'distribution',
+])
+const DISTRIBUTION_CONFIG_KEYS = new Set([
+  'role', 'databaseUrlEnv', 'scopeId', 'workerId', 'workerAgentPreset', 'pools',
+  'workspaceMappings', 'concurrency', 'leaseMs', 'heartbeatMs', 'pollMs',
+  'maxDeliveryAttempts',
+])
+const LANE_CONFIG_KEYS = new Set([
+  'name', 'description', 'kind', 'transport', 'execution', 'executor', 'verifier',
+  'planner', 'plannerTools', 'maxPlanSteps', 'maxPlanPatches', 'maxTotalChildRuns',
+  'taskTimeoutMs', 'retryOnRevise', 'maxAttempts', 'childTimeoutMs',
+  'requiredCriteria', 'executorTools', 'verifierTools',
+])
+const ROUTE_CONFIG_KEYS = new Set(['provider', 'model', 'maxTokens'])
+const EXECUTION_CONFIG_KEYS = new Set(['mode', 'pool', 'workspaceRef'])
+const CRITERION_CONFIG_KEYS = new Set(['id', 'text'])
+
+function exactConfigObject(value, keys, label) {
+  if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype) {
+    throw new TypeError(`${label} must be a plain object`)
+  }
+  const unknown = Object.keys(value).find(key => !keys.has(key))
+  if (unknown !== undefined) throw new TypeError(`${label} contains unknown field ${JSON.stringify(unknown)}`)
+  return value
+}
+
+/** Reject fields the public configuration wire does not own before schema defaults can hide them. */
+export function assertExactDispatcherConfig(value) {
+  const policy = exactConfigObject(value, POLICY_CONFIG_KEYS, 'dispatcher configuration')
+  const lanes = exactConfigObject(policy.lanes, new Set(Object.keys(policy.lanes ?? {})), 'dispatcher lanes')
+  for (const [id, laneValue] of Object.entries(lanes)) {
+    const lane = exactConfigObject(laneValue, LANE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)}`)
+    exactConfigObject(lane.execution, EXECUTION_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} execution`)
+    exactConfigObject(lane.executor, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} executor`)
+    exactConfigObject(lane.verifier, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} verifier`)
+    if (lane.planner !== undefined) {
+      exactConfigObject(lane.planner, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} planner`)
+    }
+    if (Array.isArray(lane.requiredCriteria)) {
+      lane.requiredCriteria.forEach((criterion, index) => {
+        exactConfigObject(
+          criterion,
+          CRITERION_CONFIG_KEYS,
+          `dispatcher lane ${JSON.stringify(id)} criterion ${String(index)}`,
+        )
+      })
+    }
+  }
+  const distribution = exactConfigObject(
+    policy.distribution,
+    DISTRIBUTION_CONFIG_KEYS,
+    'dispatcher distribution configuration',
+  )
+  exactConfigObject(
+    distribution.workspaceMappings,
+    new Set(Object.keys(distribution.workspaceMappings ?? {})),
+    'dispatcher distribution workspace mappings',
+  )
+  return value
+}
+
+function jsonConfigClone(value) {
+  return JSON.parse(JSON.stringify(value))
+}
+
+function jsonValuesEqual(left, right) {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((entry, index) => jsonValuesEqual(entry, right[index]))
+  }
+  if (!isRecord(left) || !isRecord(right)) return false
+  const leftKeys = Object.keys(left)
+  const rightKeys = Object.keys(right)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every(key => own(right, key) && jsonValuesEqual(left[key], right[key]))
+}
+
+/** Build the smallest user layer that recreates one full effective policy over its deployment base. */
+export function dispatcherConfigOverride(value, base, path = 'configuration') {
+  if (jsonValuesEqual(value, base)) return undefined
+  if (Array.isArray(value) || Array.isArray(base) || !isRecord(value) || !isRecord(base)) {
+    return jsonConfigClone(value)
+  }
+  for (const key of Object.keys(base)) {
+    if (!own(value, key)) {
+      throw new TypeError(`${path}.${key} is deployment-owned and cannot be removed`)
+    }
+  }
+  const result = {}
+  for (const [key, entry] of Object.entries(value)) {
+    const next = own(base, key)
+      ? dispatcherConfigOverride(entry, base[key], `${path}.${key}`)
+      : jsonConfigClone(entry)
+    if (next !== undefined) result[key] = next
+  }
+  return Object.keys(result).length === 0 ? undefined : result
+}
+
+function disabledDispatcherConfig() {
+  return resolveDispatcherConfig({
+    lanes: {
+      disabled: {
+        executor: { provider: 'disabled', model: 'disabled' },
+        verifier: { provider: 'disabled', model: 'disabled' },
+        requiredCriteria: [{ id: 'disabled', text: 'Dispatcher configuration must be repaired' }],
+        maxAttempts: 1,
+      },
+    },
+  })
+}
+
+function settingsDescriptor(settings) {
+  return settings.describe({ redactSecrets: true })
+    .find(entry => String(entry.ns) === TASK_DISPATCHER_SETTINGS_NAMESPACE)
+}
+
+/** Owner-side settings adapter; the namespace stays private to this plugin's loopback RPC. */
+export function createDispatcherConfigController(settings, baseConfig, logger) {
+  const base = jsonConfigClone(baseConfig)
+  let scope
+  let registrationFailure
+  if (settings !== undefined && settings !== null) {
+    try {
+      // Storage stays permissive so a cross-field-invalid manual YAML edit can
+      // still be repaired through this page. Activation and every RPC save are
+      // strict and use resolveDispatcherConfig below.
+      scope = settings.register(
+        TASK_DISPATCHER_SETTINGS_NAMESPACE,
+        z.any(),
+        { base, applies: 'restart' },
+      )
+    } catch (error) {
+      registrationFailure = `settings registration failed: ${errorText(error)}`
+      telemetryWarn(logger, registrationFailure)
+    }
+  }
+
+  const unavailable = () => ({
+    protocolVersion: TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION,
+    available: false,
+    writable: false,
+    applies: 'restart',
+    revision: 0,
+    value: base,
+    base,
+    userLaneIds: [],
+    ...(registrationFailure === undefined ? {} : { invalid: registrationFailure }),
+  })
+
+  const snapshot = () => {
+    if (scope === undefined || settings === undefined || settings === null) return unavailable()
+    const descriptor = settingsDescriptor(settings)
+    if (descriptor === undefined) return unavailable()
+    let value = base
+    let invalid
+    try {
+      const stored = scope.get()
+      assertExactDispatcherConfig(stored)
+      value = jsonConfigClone(resolveDispatcherConfig(jsonConfigClone(stored)))
+    } catch (error) {
+      invalid = errorText(error)
+    }
+    const userLanes = isRecord(descriptor.user) && isRecord(descriptor.user.lanes)
+      ? Object.keys(descriptor.user.lanes).filter(id => !own(base.lanes, id)).sort()
+      : []
+    return {
+      protocolVersion: TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION,
+      available: true,
+      writable: settings.writable === true,
+      applies: 'restart',
+      revision: Number.isSafeInteger(descriptor.revision) ? descriptor.revision : 0,
+      value,
+      base,
+      userLaneIds: userLanes,
+      ...(invalid === undefined ? {} : { invalid: clipped(invalid, TELEMETRY_MAX_ERROR_LENGTH) }),
+    }
+  }
+
+  const activeConfig = () => {
+    if (scope === undefined) return registrationFailure === undefined ? baseConfig : disabledDispatcherConfig()
+    try {
+      const stored = scope.get()
+      assertExactDispatcherConfig(stored)
+      return resolveDispatcherConfig(jsonConfigClone(stored))
+    } catch (error) {
+      telemetryWarn(logger, `dsh-task-dispatcher disabled by invalid stored configuration: ${errorText(error)}`)
+      return disabledDispatcherConfig()
+    }
+  }
+
+  const save = async (value, expectedRevision) => {
+    if (scope === undefined || settings === undefined || settings === null) {
+      const error = new Error('task dispatcher settings are unavailable')
+      error.code = 'CONFIG_UNAVAILABLE'
+      throw error
+    }
+    if (settings.writable !== true) {
+      const error = new Error('task dispatcher settings are read-only')
+      error.code = 'CONFIG_READ_ONLY'
+      throw error
+    }
+    assertExactDispatcherConfig(value)
+    const resolved = jsonConfigClone(resolveDispatcherConfig(value))
+    const override = dispatcherConfigOverride(resolved, base) ?? {}
+    await settings.replace(TASK_DISPATCHER_SETTINGS_NAMESPACE, override, expectedRevision)
+    return snapshot()
+  }
+
+  return { activeConfig, snapshot, save }
+}
+
+function exactConfigRpcPayload(endpoint, payload) {
+  if (!isRecord(payload) || Object.getPrototypeOf(payload) !== Object.prototype) {
+    throw new TypeError('task dispatcher configuration RPC payload must be a plain object')
+  }
+  let encoded
+  try {
+    encoded = JSON.stringify(payload)
+  } catch (error) {
+    throw new TypeError(`task dispatcher configuration RPC payload is not JSON-compatible: ${errorText(error)}`)
+  }
+  if (Buffer.byteLength(encoded, 'utf8') > CONFIG_RPC_MAX_BYTES) {
+    throw new TypeError(`task dispatcher configuration RPC payload exceeds ${CONFIG_RPC_MAX_BYTES} bytes`)
+  }
+  if (endpoint === 'snapshot') {
+    if (Object.keys(payload).length !== 0) throw new TypeError('configuration snapshot payload must be empty')
+    return {}
+  }
+  if (endpoint === 'save') {
+    const keys = Object.keys(payload)
+    if (keys.length !== 2 || !keys.includes('expectedRevision') || !keys.includes('value')) {
+      throw new TypeError('configuration save payload must contain exactly expectedRevision and value')
+    }
+    if (!Number.isSafeInteger(payload.expectedRevision) || payload.expectedRevision < 0) {
+      throw new TypeError('configuration expectedRevision must be a non-negative safe integer')
+    }
+    if (!isRecord(payload.value) || Object.getPrototypeOf(payload.value) !== Object.prototype) {
+      throw new TypeError('configuration value must be a plain object')
+    }
+    return { expectedRevision: payload.expectedRevision, value: payload.value }
+  }
+  throw new TypeError(`unknown task dispatcher configuration RPC endpoint ${JSON.stringify(endpoint)}`)
+}
+
+/** Generic Connection handler for restart-scoped plugin policy. */
+export function createDispatcherConfigRpcHandler(controller) {
+  return async (endpoint, payload, signal) => {
+    if (signal?.aborted) {
+      return { ok: false, error: { code: 'cancelled', message: 'task dispatcher configuration request cancelled', details: {} } }
+    }
+    let parsed
+    try {
+      parsed = exactConfigRpcPayload(endpoint, payload)
+    } catch (error) {
+      return {
+        ok: false,
+        error: { code: 'bad-request', message: clipped(errorText(error), TELEMETRY_MAX_ERROR_LENGTH), details: {} },
+      }
+    }
+    try {
+      const value = endpoint === 'save'
+        ? await controller.save(parsed.value, parsed.expectedRevision)
+        : controller.snapshot()
+      return { ok: true, value }
+    } catch (error) {
+      const code = error?.code === 'SETTINGS_CONFLICT'
+        ? 'conflict'
+        : error?.code === 'CONFIG_UNAVAILABLE'
+          ? 'unavailable'
+          : error?.code === 'CONFIG_READ_ONLY'
+            ? 'read-only'
+            : error instanceof TypeError ? 'invalid-config' : 'internal'
+      return {
+        ok: false,
+        error: {
+          code,
+          message: clipped(errorText(error), TELEMETRY_MAX_ERROR_LENGTH),
+          details: code === 'conflict'
+            ? { expected: error.expected, actual: error.actual }
+            : {},
+        },
+      }
+    }
+  }
+}
+
+/** Optionally expose policy configuration when the Web Connection service exists. */
+export function registerDispatcherConfigRpc(ctx, controller) {
+  if (typeof ctx.inject !== 'function') return
+  try {
+    ctx.inject(['connection'], (inner) => {
+      try {
+        inner.connection.rpc.handle(
+          TASK_DISPATCHER_CONFIG_RPC_CHANNEL,
+          createDispatcherConfigRpcHandler(controller),
+          { authority: 'loopback' },
+        )
+      } catch (error) {
+        telemetryWarn(inner.logger ?? ctx.logger, error)
+      }
+    })
+  } catch (error) {
+    telemetryWarn(ctx.logger, error)
+  }
 }
 
 /** Merge deployment criteria with stricter task-local criteria. */
@@ -4144,25 +4466,18 @@ export function createDispatcherCancelTool(runtime, ctx) {
 
 /** Mount the failure-contained runtime, approval gate, and dispatch tool. */
 export function apply(ctx, rawConfig = {}) {
-  let config
+  let baseConfig
   try {
-    config = resolveDispatcherConfig(rawConfig)
+    baseConfig = resolveDispatcherConfig(rawConfig)
   } catch (error) {
     // Keep the host available when direct apply/HMR provides bad policy. The
     // loader's outer schema may still reject malformed YAML before apply; an
     // external process supervisor remains required for process-level HA.
     ctx.logger.error(`dsh-task-dispatcher disabled by invalid configuration: ${errorText(error)}`)
-    config = resolveDispatcherConfig({
-      lanes: {
-        disabled: {
-          executor: { provider: 'disabled', model: 'disabled' },
-          verifier: { provider: 'disabled', model: 'disabled' },
-          requiredCriteria: [{ id: 'disabled', text: 'Dispatcher configuration must be repaired' }],
-          maxAttempts: 1,
-        },
-      },
-    })
+    baseConfig = disabledDispatcherConfig()
   }
+  const configController = createDispatcherConfigController(ctx.get?.('settings'), baseConfig, ctx.logger)
+  const config = configController.activeConfig()
   const runtime = new DispatcherRuntime(ctx, config)
   ctx.effect(() => async () => {
     await Promise.allSettled([
@@ -4174,6 +4489,7 @@ export function apply(ctx, rawConfig = {}) {
     runtime.distributed = new DistributedDispatcherRuntime(ctx, config, runtime.telemetry)
   }
   registerDispatcherTelemetryRpc(ctx, runtime.telemetry)
+  registerDispatcherConfigRpc(ctx, configController)
   ctx.on('tools/pre-execute', async (exec, next) => {
     const decision = await next()
     if (decision.kind !== 'allow' || ![TOOL_NAME, CANCEL_TOOL_NAME].includes(exec.name)) return decision

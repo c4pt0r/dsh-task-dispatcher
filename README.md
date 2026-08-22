@@ -389,9 +389,54 @@ payloads. The PostgreSQL task record is durable; this Web read-model is not, so
 a coordinator restart clears the live card. Use `dispatch_status` from the
 exact origin Session when the durable ledger is the source of truth.
 
+### Web configuration
+
+Open **Settings → Plugins → Task Dispatcher** to edit the complete dispatcher
+policy without hand-writing YAML. The page covers global defaults, lane model
+routes and tool allow-lists, planning and retry budgets, acceptance criteria,
+execution placement, and distributed roles, pools, and workspace mappings.
+
+Saving writes the `dsh-task-dispatcher` user section to the Harness settings
+document (by default `$DSH_HOME/settings.yaml`). It does **not** hot-swap the
+running dispatcher: every saved change is marked **Restart required** and is
+read the next time DSH starts. Existing tasks, child Agents, workers, and claim
+loops continue with the policy that was activated for the current process.
+Reloading the browser page or Web client bundle is not an activation boundary;
+restart the DSH Host process.
+
+The form stages edits in the browser and saves the complete effective policy
+with the revision it originally loaded. If another tab, tool, or manual
+settings edit wins that revision first, the save is refused rather than
+overwriting it. The page then loads the newest Host snapshot while retaining
+the local draft so the user can reconcile or discard it.
+
+The bundle/profile configuration is the deployment-owned base. A base lane can
+be overridden but not deleted; its planner and base workspace mappings also
+cannot be removed from the user layer. User-created lanes and mappings can be
+removed. **Reset to profile defaults** stages the current base and, after a
+successful save, clears the plugin's user overrides.
+
+The configuration channel is plugin-owned and loopback-only; installing this
+out-of-tree bundle does not require adding its namespace to the Harness core
+Settings API allow-list. The page edits only the environment-variable name in
+`databaseUrlEnv`: the PostgreSQL URL, password, and other environment values
+are never returned to the browser. Treat `liveRoot`, `stagingRoot`, and
+`workspaceMappings` as privileged absolute paths; browser validation is only
+an early aid and the Host remains the final policy authority.
+
+An object-shaped but structurally invalid stored `dsh-task-dispatcher` section
+is never activated. The plugin keeps the Host running with a disabled,
+repair-required fallback, and the page exposes the validation error so the
+user can correct the draft or reset it to the profile base. The repaired policy
+still takes effect only after DSH restarts. If the namespace itself is a scalar
+or array instead of a YAML mapping, core Settings rejects owner registration
+before an editable scope exists; repair that section manually. Malformed YAML
+syntax is a separate document-level error that may prevent the Settings service
+from loading before this plugin starts and also requires manual repair.
+
 ## Install locally
 
-Install and test this project, then add its absolute path to a DSH profile that already provides the standard agents, jobs, subagents, and tools services:
+Install and test this project, then add its absolute path to a DSH profile that already provides the standard agents, jobs, settings, subagents, and tools services:
 
 ```sh
 cd /path/to/dsh-task-dispatcher
@@ -404,6 +449,10 @@ cd /path/to/deepseek-harness
 pnpm dsh plugin --profile web add /path/to/dsh-task-dispatcher
 pnpm dsh --profile web --dump-config
 ```
+
+The Host `settings` service is a hard dependency, not an optional enhancement.
+A profile that omits it cannot compose this plugin; this is distinct from the
+page reporting a configured provider as read-only or temporarily unavailable.
 
 The dumped composition should contain a `dsh-task-dispatcher` row whose plugin
 name is the package root, `dsh-task-dispatcher`. That root row is required for
@@ -472,6 +521,12 @@ At the Jobs layer, a finished `rejected` or `blocked` task is still a completed 
 ## Configure lanes
 
 Lanes are deployment policy, not model-controlled input. The model calling `dispatch_task` selects only one of the configured lane ids; it cannot supply a provider, model, token budget, tools, timeout, or retry count.
+
+For an interactive deployment, use **Settings → Plugins → Task Dispatcher**;
+the tables below are the field reference for that form. Direct YAML remains
+useful for composing a deployment-owned base or automating an installation.
+The settings user layer is stored as a minimal override on top of that base,
+and either editing path requires a DSH restart before the new policy is active.
 
 The complete plugin-level settings are:
 
@@ -626,10 +681,14 @@ This plugin is fail-closed at its boundary. Invalid tool inputs, an unavailable 
 The exported Loader schema is deliberately permissive so a bad dispatcher
 policy reaches the plugin's containment boundary instead of aborting the whole
 plugin tree. The plugin then logs the validation error, drops the requested
-lanes, and exposes only a repair-required fallback policy. Invalid YAML syntax,
-missing core services, or faults elsewhere in the composition can still fail
-before this plugin runs; validate composition with `--dump-config` before
-activating it.
+lanes, and exposes only a repair-required fallback policy. A parsed,
+object-shaped `dsh-task-dispatcher` user section whose fields are invalid
+remains visible to the Web configuration page for correction or reset and is
+never used by the active dispatcher. A scalar or array in place of that
+namespace mapping, invalid YAML syntax, missing core services, or faults
+elsewhere in the composition can still fail before an editable scope exists;
+repair the settings document manually and validate composition with
+`--dump-config` before activating it.
 
 Executor and verifier children are separate Sessions but currently run in the same Node process. This is logical isolation, not an operating-system process boundary. A blocking native call, event-loop deadlock, OOM, runtime crash, `SIGKILL`, kernel failure, power loss, or machine loss cannot be contained by JavaScript in the same process.
 

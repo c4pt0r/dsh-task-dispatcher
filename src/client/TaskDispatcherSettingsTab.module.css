@@ -1,0 +1,248 @@
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 760px;
+  min-width: 0;
+  color: var(--dsw-alias-label-primary);
+}
+
+.page h2,
+.page h4,
+.page p { margin: 0; }
+
+.page h2 { font-size: 18px; font-weight: 600; }
+.page h4 { font-size: 14px; font-weight: 600; }
+
+.pageHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.pageHead > div { min-width: 0; display: grid; gap: 5px; }
+.pageHead p,
+.sectionIntro { color: var(--dsw-alias-label-tertiary); font-size: 13px; line-height: 1.5; }
+
+.status,
+.empty { color: var(--dsw-alias-label-tertiary); font-size: 13px; }
+
+.notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 11px 12px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.notice > div { min-width: 0; display: grid; gap: 3px; }
+.notice strong { font-size: 13px; }
+.notice p { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
+.notice[data-tone='error'] { border-color: color-mix(in srgb, var(--dsw-alias-label-error) 40%, transparent); }
+.notice[data-tone='restart'] { background: var(--dsw-alias-bg-module-platform); }
+
+.form { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+.sectionCard {
+  min-width: 0;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 12px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.sectionCard > legend {
+  padding: 0 6px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sectionCard > * + * { margin-top: 12px; }
+
+.grid2,
+.grid3 {
+  display: grid;
+  gap: 12px;
+  align-items: start;
+}
+
+.grid2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.grid3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+.field { min-width: 0; display: flex; flex-direction: column; gap: 5px; }
+.label { font-size: 12px; font-weight: 500; color: var(--dsw-alias-label-secondary); }
+
+.input {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 8px;
+  padding: 7px 9px;
+  background: var(--dsw-alias-bg-layer-2);
+  color: var(--dsw-alias-label-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+textarea.input { resize: vertical; }
+.input:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.input[aria-invalid='true'] { border-color: var(--dsw-alias-label-error); }
+.input:disabled { opacity: .58; cursor: not-allowed; }
+
+.hint,
+.validation { min-height: 16px; font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.hint { color: var(--dsw-alias-label-tertiary); }
+.validation { color: var(--dsw-alias-label-error); }
+
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  border-radius: 8px;
+  padding: 8px 0;
+  cursor: pointer;
+}
+
+.check input { margin-top: 3px; }
+.check span { display: grid; gap: 3px; }
+.check strong { font-size: 13px; }
+.check small { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.45; }
+
+.lanes,
+.criteria,
+.mappings { display: flex; flex-direction: column; gap: 10px; }
+
+.laneCard {
+  min-width: 0;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 10px;
+  background: var(--dsw-alias-bg-layer-2);
+  overflow: clip;
+}
+
+.laneSummary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 11px 12px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.laneSummary > span:first-child { min-width: 0; overflow-wrap: anywhere; }
+.laneSummary:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: -2px; }
+
+.laneBody {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+}
+
+.route,
+.criterion {
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+}
+
+.route > legend,
+.criterion > legend { padding: 0 5px; font-size: 12px; font-weight: 600; }
+
+.subhead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.subhead > div { min-width: 0; display: grid; gap: 4px; }
+.dangerRow { display: flex; justify-content: flex-end; }
+
+.addLane,
+.addRow {
+  display: grid;
+  grid-template-columns: max-content minmax(120px, 1fr) max-content;
+  align-items: center;
+  gap: 8px;
+}
+
+.addLane > label,
+.addRow > label { font-size: 12px; font-weight: 500; }
+.addLane > p { grid-column: 2 / -1; }
+
+.mapping {
+  display: grid;
+  grid-template-columns: minmax(100px, .7fr) minmax(180px, 1.3fr) max-content;
+  align-items: end;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+}
+
+.mapping > button { margin-bottom: 21px; }
+
+.advanced,
+.yaml {
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+  padding: 10px 12px;
+}
+
+.advanced > summary,
+.yaml > summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+.advanced > div { margin-top: 12px; }
+.yaml p { margin-top: 8px; color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+.yaml code { display: block; margin-top: 8px; padding: 8px; border-radius: 7px; background: var(--dsw-alias-bg-layer-3); }
+
+.footer {
+  position: sticky;
+  bottom: -24px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 0;
+  border-top: 1px solid var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-bg-layer-2);
+}
+
+.footerStatus {
+  flex: 1;
+  min-width: 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 680px) {
+  .pageHead,
+  .subhead { align-items: stretch; flex-direction: column; }
+  .grid2,
+  .grid3,
+  .mapping,
+  .addLane,
+  .addRow { grid-template-columns: minmax(0, 1fr); }
+  .mapping > button { margin-bottom: 0; justify-self: start; }
+  .addLane > p { grid-column: auto; }
+  .footer { flex-wrap: wrap; bottom: -24px; }
+  .footerStatus { flex-basis: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .laneCard,
+  .input { scroll-behavior: auto; }
+}

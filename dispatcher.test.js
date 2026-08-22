@@ -18,14 +18,18 @@ import {
   acceptanceGate,
   apply,
   applyPlanPatch,
+  assertExactDispatcherConfig,
   assertSafeWorkspace,
   buildPlanReviewPrompt,
   createDispatcherTelemetry,
   createDispatcherTelemetryRpcHandler,
   createDispatcherTool,
+  createDispatcherConfigController,
+  createDispatcherConfigRpcHandler,
   createDistributedTaskEnvelope,
   createMasterPlan,
   dispatcherTelemetrySnapshot,
+  dispatcherConfigOverride,
   dispatcherWorkerRole,
   distributedAdmissionDigest,
   distributedLanePolicyDigest,
@@ -308,12 +312,147 @@ test('configuration resolves defaults and enforces cross-field policy', async (t
       },
       pattern: /24|length|array/u,
     },
+    {
+      name: 'database setting is an environment variable name, not a URL',
+      value: {
+        distribution: { role: 'coordinator', databaseUrlEnv: 'postgres://secret@example.invalid/db' },
+        lanes: {},
+      },
+      pattern: /environment variable name/u,
+    },
   ]
 
   for (const example of invalidCases) {
     await t.test(example.name, () => {
       assert.throws(() => resolveDispatcherConfig(example.value), example.pattern)
     })
+  }
+})
+
+test('configuration RPC is strict, restart-scoped, minimal, and revision fenced', async () => {
+  const base = JSON.parse(JSON.stringify(config()))
+  const freeze = (value) => {
+    if (value !== null && typeof value === 'object') {
+      for (const entry of Object.values(value)) freeze(entry)
+      Object.freeze(value)
+    }
+    return value
+  }
+  const merge = (under, over) => {
+    if (Array.isArray(over) || typeof over !== 'object' || over === null) return structuredClone(over)
+    const result = typeof under === 'object' && under !== null && !Array.isArray(under)
+      ? structuredClone(under)
+      : {}
+    for (const [key, value] of Object.entries(over)) result[key] = merge(result[key], value)
+    return result
+  }
+  let revision = 0
+  let user = {}
+  let effective = freeze(structuredClone(base))
+  const settings = {
+    writable: true,
+    register(ns, _schema, options) {
+      assert.equal(ns, 'dsh-task-dispatcher')
+      assert.equal(options.applies, 'restart')
+      assert.deepEqual(options.base, base)
+      return { get: () => effective }
+    },
+    describe(options) {
+      assert.deepEqual(options, { redactSecrets: true })
+      return [{ ns: 'dsh-task-dispatcher', revision, user, value: effective, base, applies: 'restart' }]
+    },
+    async replace(ns, section, expectedRevision) {
+      assert.equal(ns, 'dsh-task-dispatcher')
+      if (expectedRevision !== revision) {
+        throw Object.assign(new Error('stale configuration'), {
+          code: 'SETTINGS_CONFLICT', expected: expectedRevision, actual: revision,
+        })
+      }
+      user = structuredClone(section)
+      effective = freeze(merge(base, user))
+      revision += 1
+    },
+  }
+  const controller = createDispatcherConfigController(settings, base, { warn() {} })
+  assert.deepEqual(controller.activeConfig(), resolveDispatcherConfig(base))
+  const initial = controller.snapshot()
+  assert.equal(initial.available, true)
+  assert.equal(initial.applies, 'restart')
+  assert.equal(initial.revision, 0)
+  assert.deepEqual(initial.userLaneIds, [])
+
+  const changed = structuredClone(base)
+  changed.maxConsecutiveFailures = 7
+  changed.lanes.code.executor.model = 'executor-model-v2'
+  changed.lanes.review = structuredClone(base.lanes.code)
+  changed.lanes.review.name = 'User review lane'
+  const saved = await controller.save(changed, 0)
+  assert.equal(saved.revision, 1)
+  assert.deepEqual(user.lanes.code, { executor: { model: 'executor-model-v2' } })
+  assert.deepEqual(user.lanes.review, changed.lanes.review)
+  assert.equal(user.maxConsecutiveFailures, 7)
+  assert.deepEqual(saved.userLaneIds, ['review'])
+
+  const handler = createDispatcherConfigRpcHandler(controller)
+  const read = await handler('snapshot', {})
+  assert.equal(read.ok, true)
+  assert.equal(read.value.value.lanes.code.executor.model, 'executor-model-v2')
+  const stale = await handler('save', { expectedRevision: 0, value: changed })
+  assert.deepEqual(stale, {
+    ok: false,
+    error: {
+      code: 'conflict',
+      message: 'stale configuration',
+      details: { expected: 0, actual: 1 },
+    },
+  })
+  const extra = await handler('save', { expectedRevision: 1, value: { ...changed, surprise: true } })
+  assert.equal(extra.ok, false)
+  assert.equal(extra.error.code, 'invalid-config')
+  const badPayload = await handler('snapshot', { unexpected: true })
+  assert.equal(badPayload.ok, false)
+  assert.equal(badPayload.error.code, 'bad-request')
+  const oversized = await handler('save', {
+    expectedRevision: 1,
+    value: { note: '界'.repeat(400_000) },
+  })
+  assert.equal(oversized.ok, false)
+  assert.match(oversized.error.message, /exceeds/u)
+  const aborted = new AbortController()
+  aborted.abort()
+  assert.equal((await handler('snapshot', {}, aborted.signal)).error.code, 'cancelled')
+
+  const withoutUserLane = structuredClone(changed)
+  delete withoutUserLane.lanes.review
+  const removedUserLane = await controller.save(withoutUserLane, 1)
+  assert.deepEqual(removedUserLane.userLaneIds, [])
+  assert.equal('review' in user.lanes, false)
+
+  const removedBaseLane = structuredClone(changed)
+  delete removedBaseLane.lanes.code
+  assert.throws(() => dispatcherConfigOverride(removedBaseLane, base), /deployment-owned/u)
+  assert.throws(() => assertExactDispatcherConfig({ ...changed, unknown: true }), /unknown field/u)
+})
+
+test('configuration RPC stays unavailable without Settings and never exposes an environment value', async () => {
+  const base = JSON.parse(JSON.stringify(config({
+    distribution: { role: 'disabled', databaseUrlEnv: 'PRIVATE_DATABASE_URL' },
+  })))
+  process.env.PRIVATE_DATABASE_URL = 'postgres://user:password@example.invalid/private'
+  try {
+    const controller = createDispatcherConfigController(undefined, base, { warn() {} })
+    const snapshot = controller.snapshot()
+    assert.equal(snapshot.available, false)
+    assert.equal(snapshot.writable, false)
+    assert.equal(JSON.stringify(snapshot).includes(process.env.PRIVATE_DATABASE_URL), false)
+    const response = await createDispatcherConfigRpcHandler(controller)(
+      'save',
+      { expectedRevision: 0, value: base },
+    )
+    assert.equal(response.ok, false)
+    assert.equal(response.error.code, 'unavailable')
+  } finally {
+    delete process.env.PRIVATE_DATABASE_URL
   }
 })
 
