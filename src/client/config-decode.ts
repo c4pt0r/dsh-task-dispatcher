@@ -5,6 +5,8 @@ import {
   LANE_EXECUTION_MODES,
   LANE_KINDS,
   LANE_TRANSPORTS,
+  ORCHESTRATION_FAILURE_MODES,
+  ORCHESTRATION_WORKSPACE_MODES,
   type DispatcherConfigSnapshot,
   type DispatcherCriterionConfig,
   type DispatcherDistributionConfig,
@@ -80,13 +82,19 @@ function criteria(value: unknown, path: string): DispatcherCriterionConfig[] {
 function lane(value: unknown, path: string): DispatcherLaneConfig {
   const source = record(value, path)
   exact(source, [
-    'name', 'description', 'kind', 'transport', 'execution', 'executor', 'verifier', 'planner',
+    'name', 'description', 'kind', 'transport', 'execution', 'orchestration', 'executor', 'verifier', 'planner',
     'plannerTools', 'maxPlanSteps', 'maxPlanPatches', 'maxTotalChildRuns', 'taskTimeoutMs',
     'retryOnRevise', 'maxAttempts', 'childTimeoutMs', 'requiredCriteria', 'executorTools',
     'verifierTools',
   ], path)
   const execution = record(source['execution'], `${path}.execution`)
   exact(execution, ['mode', 'pool', 'workspaceRef'], `${path}.execution`)
+  const orchestration = record(source['orchestration'], `${path}.orchestration`)
+  exact(orchestration, [
+    'enabled', 'childLane', 'maxDepth', 'maxTaskNodes', 'maxChildrenPerNode',
+    'maxConcurrentNodes', 'maxTotalModelRuns', 'maxResultBytes', 'workspaceMode',
+    'failureMode',
+  ], `${path}.orchestration`)
   const planner = source['planner']
   const executorTools = source['executorTools']
   return {
@@ -98,6 +106,26 @@ function lane(value: unknown, path: string): DispatcherLaneConfig {
       mode: oneOf(execution['mode'], LANE_EXECUTION_MODES, `${path}.execution.mode`),
       pool: string(execution['pool'], `${path}.execution.pool`),
       workspaceRef: string(execution['workspaceRef'], `${path}.execution.workspaceRef`),
+    },
+    orchestration: {
+      enabled: boolean(orchestration['enabled'], `${path}.orchestration.enabled`),
+      childLane: string(orchestration['childLane'], `${path}.orchestration.childLane`),
+      maxDepth: integer(orchestration['maxDepth'], `${path}.orchestration.maxDepth`),
+      maxTaskNodes: integer(orchestration['maxTaskNodes'], `${path}.orchestration.maxTaskNodes`),
+      maxChildrenPerNode: integer(orchestration['maxChildrenPerNode'], `${path}.orchestration.maxChildrenPerNode`),
+      maxConcurrentNodes: integer(orchestration['maxConcurrentNodes'], `${path}.orchestration.maxConcurrentNodes`),
+      maxTotalModelRuns: integer(orchestration['maxTotalModelRuns'], `${path}.orchestration.maxTotalModelRuns`),
+      maxResultBytes: integer(orchestration['maxResultBytes'], `${path}.orchestration.maxResultBytes`),
+      workspaceMode: oneOf(
+        orchestration['workspaceMode'],
+        ORCHESTRATION_WORKSPACE_MODES,
+        `${path}.orchestration.workspaceMode`,
+      ),
+      failureMode: oneOf(
+        orchestration['failureMode'],
+        ORCHESTRATION_FAILURE_MODES,
+        `${path}.orchestration.failureMode`,
+      ),
     },
     executor: route(source['executor'], `${path}.executor`),
     verifier: route(source['verifier'], `${path}.verifier`),

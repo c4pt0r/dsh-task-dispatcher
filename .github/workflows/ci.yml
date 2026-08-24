@@ -34,6 +34,9 @@ jobs:
       - name: Test
         run: pnpm test
 
+      - name: Verify committed Web bundle is current
+        run: git diff --exit-code -- lib/client.js lib/client.js.map
+
       - name: Typecheck
         run: pnpm run typecheck
 

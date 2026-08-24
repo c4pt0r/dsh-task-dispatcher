@@ -95,7 +95,7 @@ function stateWithTasks(
   view: Partial<DispatcherViewState> = {},
 ): DispatcherViewState {
   const snapshot: DispatcherSnapshot = {
-    protocolVersion: 1,
+    protocolVersion: 2,
     revision: 3,
     sessionId: 'session-1',
     generatedAt: 3,
@@ -252,6 +252,19 @@ describe('TaskDispatcherAction', () => {
     expect(within(dialog).getByText('agent-plan')).toBeTruthy()
   })
 
+  it('labels recursive child tasks with their verified parent DAG node', () => {
+    const parent = task({ taskId: 'task-root', title: '根任务' })
+    const child = task({
+      taskId: 'task-child',
+      title: '检查页面',
+      orchestration: { parentTaskId: 'task-root', nodeId: 'inspect', depth: 1 },
+    })
+    render(<TaskDispatcherAction {...props(stateWithTasks([parent, child]))} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(screen.getByText('父任务：根任务 · 节点 inspect · 深度 1')).toBeTruthy()
+  })
+
   it('leaves the local task card unchanged when distributed telemetry is absent', () => {
     render(<TaskDispatcherAction {...props(state())} />)
     fireEvent.click(screen.getByRole('button'))
@@ -365,7 +378,7 @@ describe('TaskDispatcherAction', () => {
     expect(screen.getByRole('alert').textContent).toContain('bad wire')
 
     const emptySnapshot: DispatcherSnapshot = {
-      protocolVersion: 1, revision: 1, sessionId: 'session-1', generatedAt: 1, tasks: [],
+      protocolVersion: 2, revision: 1, sessionId: 'session-1', generatedAt: 1, tasks: [],
     }
     rerender(<TaskDispatcherAction {...props({ phase: 'ready', snapshot: emptySnapshot })} />)
     expect(screen.getByRole('button', { name: /打开任务执行计划/ }).textContent).toContain(zh['header.empty'])

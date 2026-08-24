@@ -448,7 +448,11 @@ function PlanBody({ plan, task, t }: {
   )
 }
 
-function TaskCard({ task, t }: { readonly task: DispatcherTask; readonly t: Translate }) {
+function TaskCard({ parentTitle, task, t }: {
+  readonly parentTitle?: string
+  readonly task: DispatcherTask
+  readonly t: Translate
+}) {
   const [open, setOpen] = useState(task.status === 'running')
   const stepIds = new Set(task.masterPlan?.steps.map(step => step.id) ?? [])
   const taskWorkers = task.workers.filter(worker => worker.stepId === undefined || !stepIds.has(worker.stepId))
@@ -478,6 +482,13 @@ function TaskCard({ task, t }: { readonly task: DispatcherTask; readonly t: Tran
           <div className={css.taskMeta}>
             <code>{task.taskId}</code>
             <span>{t('task.meta', { lane: task.lane, phase })}</span>
+            {task.orchestration === undefined ? null : (
+              <span>{t('task.orchestration.parent', {
+                parent: parentTitle ?? task.orchestration.parentTaskId,
+                node: task.orchestration.nodeId,
+                depth: task.orchestration.depth,
+              })}</span>
+            )}
           </div>
           {task.distribution === undefined
             ? null
@@ -507,6 +518,7 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
     if ((left.status === 'running') !== (right.status === 'running')) return left.status === 'running' ? -1 : 1
     return right.updatedAt - left.updatedAt
   }), [tasks])
+  const taskTitles = useMemo(() => new Map(tasks.map(task => [task.taskId, task.title])), [tasks])
   const summary = headerSummary(state, t)
   const runningTasks = tasks.filter(task => task.status === 'running')
   const latestTerminal = newestTask(tasks)
@@ -556,7 +568,16 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
           )
           : (
             <ul className={css.tasks} aria-label={t('tasks.aria')}>
-              {orderedTasks.map(task => <TaskCard key={task.taskId} task={task} t={t} />)}
+                    {orderedTasks.map(task => (
+                      <TaskCard
+                        key={task.taskId}
+                        task={task}
+                        parentTitle={task.orchestration === undefined
+                          ? undefined
+                          : taskTitles.get(task.orchestration.parentTaskId)}
+                        t={t}
+                      />
+                    ))}
             </ul>
           )}
       </Modal>

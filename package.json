@@ -30,6 +30,9 @@
     "./dispatcher": "./dispatcher.js",
     "./distributed-store": "./distributed-store.js",
     "./distributed-worker": "./distributed-worker.js",
+    "./orchestration": "./orchestration.js",
+    "./workspace-isolation": "./workspace-isolation.js",
+    "./config-proposals": "./config-proposals.js",
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
@@ -38,6 +41,9 @@
     "dispatcher.js",
     "distributed-store.js",
     "distributed-worker.js",
+    "orchestration.js",
+    "workspace-isolation.js",
+    "config-proposals.js",
     "lib/client.js",
     "lib/client.js.map",
     "lib/package.json",
@@ -51,9 +57,9 @@
   "scripts": {
     "bundle": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "oxlint --deny-warnings dispatcher.js dispatcher.test.js distributed-store.js distributed-store.test.js distributed-worker.js distributed-worker.test.js src/client tests/client tsdown.config.ts vitest.config.ts",
+    "lint": "oxlint --deny-warnings dispatcher.js dispatcher.test.js distributed-store.js distributed-store.test.js distributed-worker.js distributed-worker.test.js orchestration.js orchestration.test.js workspace-isolation.js workspace-isolation.test.js config-proposals.js config-proposals.test.js src/client tests/client tsdown.config.ts vitest.config.ts",
     "publint": "publint",
-    "test:host": "node --test dispatcher.test.js distributed-store.test.js distributed-worker.test.js",
+    "test:host": "node --test dispatcher.test.js distributed-store.test.js distributed-worker.test.js orchestration.test.js workspace-isolation.test.js config-proposals.test.js",
     "test:client": "npm run bundle && vitest run",
     "test": "npm run test:host && npm run test:client",
     "prepublishOnly": "npm run bundle"

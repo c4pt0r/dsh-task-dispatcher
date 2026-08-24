@@ -25,6 +25,9 @@ describe('Task Dispatcher configuration decoder', () => {
     const nested = configSnapshot()
     Object.assign(nested.value.lanes.analysis!.executor, { temperature: 1 })
     expect(() => decodeDispatcherConfigSnapshot(nested)).toThrow(/unexpected temperature/u)
+    const orchestration = configSnapshot()
+    Object.assign(orchestration.value.lanes.analysis!.orchestration, { rawTool: 'workflow' })
+    expect(() => decodeDispatcherConfigSnapshot(orchestration)).toThrow(/unexpected rawTool/u)
   })
 
   it('uses the canonical base as a repair draft only when Host marks the stored candidate invalid', () => {

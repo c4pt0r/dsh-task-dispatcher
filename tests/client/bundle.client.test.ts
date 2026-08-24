@@ -15,6 +15,11 @@ afterEach(() => {
 describe('built Web client bundle', () => {
   it('registers the exact package id, resolves only platform modules, and injects CSS once', () => {
     const code = readFileSync(resolve(process.cwd(), 'lib/client.js'), 'utf8')
+    expect(code).toContain('protocolVersion: 2')
+    expect(code).toContain('parentTaskId')
+    expect(code).not.toContain('maxPlanRevisions')
+    expect(code).not.toContain('maxWorkspaceBranches')
+    expect(code).not.toContain('cancelGraceMs')
     let registration: ClientRegistration | undefined
     runInNewContext(code, {
       document,

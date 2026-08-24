@@ -4,7 +4,7 @@ import { DispatcherSessionSource, DispatcherSourceRegistry } from '../../src/cli
 
 function snapshot(revision: number, title = `revision-${revision}`) {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     revision,
     sessionId: 'session-1',
     generatedAt: 1_700_000_000_000 + revision,

@@ -150,4 +150,64 @@ describe('validateDispatcherDraft', () => {
       'lanes.analysis.requiredCriteria': 'range',
     })
   })
+
+  it('rejects raw recursion and validates the first read-only orchestration mode', () => {
+    const config = configFixture()
+    config.lanes.leaf = structuredClone(config.lanes.analysis!)
+    config.lanes.leaf.name = 'Leaf'
+    config.lanes.leaf.planner = undefined
+    config.lanes.leaf.plannerTools = []
+    config.lanes.leaf.orchestration.enabled = false
+    config.lanes.leaf.orchestration.childLane = ''
+    config.lanes.analysis!.executorTools = ['read', 'workflow']
+    config.lanes.analysis!.orchestration = {
+      ...config.lanes.analysis!.orchestration,
+      enabled: true,
+      childLane: 'leaf',
+      workspaceMode: 'isolated-write',
+    }
+    expect(validateDispatcherDraft(config)).toMatchObject({
+      'lanes.analysis.executorTools': 'unsafe-tool',
+      'lanes.analysis.orchestration.enabled': 'orchestration',
+    })
+
+    config.lanes.analysis!.executorTools = ['read']
+    config.lanes.analysis!.orchestration.workspaceMode = 'read-shared'
+    expect(validateDispatcherDraft(config)).toEqual({})
+  })
+
+  it('rejects recursive cycles and orchestration policies that cannot fund a verified leaf', () => {
+    const config = configFixture()
+    config.lanes.leaf = structuredClone(config.lanes.analysis!)
+    config.lanes.leaf.planner = undefined
+    config.lanes.leaf.plannerTools = []
+    config.lanes.leaf.orchestration.enabled = false
+    config.lanes.leaf.orchestration.childLane = ''
+    config.lanes.analysis!.orchestration = {
+      ...config.lanes.analysis!.orchestration,
+      enabled: true,
+      childLane: 'analysis',
+      maxDepth: 2,
+      maxTaskNodes: 2,
+      maxChildrenPerNode: 1,
+      maxConcurrentNodes: 1,
+      maxTotalModelRuns: 5,
+      workspaceMode: 'read-shared',
+    }
+    expect(validateDispatcherDraft(config)).toMatchObject({
+      'lanes.analysis.orchestration.childLane': 'orchestration',
+    })
+
+    config.lanes.analysis!.orchestration.childLane = 'leaf'
+    config.lanes.analysis!.orchestration.maxTaskNodes = 1
+    expect(validateDispatcherDraft(config)).toMatchObject({
+      'lanes.analysis.orchestration.enabled': 'orchestration',
+    })
+
+    config.lanes.analysis!.orchestration.maxTaskNodes = 2
+    config.lanes.analysis!.orchestration.maxTotalModelRuns = 4
+    expect(validateDispatcherDraft(config)).toMatchObject({
+      'lanes.analysis.orchestration.enabled': 'orchestration',
+    })
+  })
 })

@@ -115,6 +115,13 @@ export interface DispatcherResult {
   readonly failureClass: 'none' | 'task' | 'infrastructure'
 }
 
+/** Host-proven relationship between one recursive child task and its parent DAG node. */
+export interface DispatcherOrchestrationRelation {
+  readonly parentTaskId: string
+  readonly nodeId: string
+  readonly depth: number
+}
+
 export interface DispatcherTask {
   readonly taskId: string
   readonly jobId?: string
@@ -125,6 +132,7 @@ export interface DispatcherTask {
   readonly startedAt: number
   readonly updatedAt: number
   readonly finishedAt?: number
+  readonly orchestration?: DispatcherOrchestrationRelation
   readonly distribution?: DispatcherDistribution
   readonly masterPlan?: DispatcherMasterPlan
   readonly workers: readonly DispatcherWorker[]
@@ -133,7 +141,7 @@ export interface DispatcherTask {
 
 /** Versioned Host snapshot returned by both snapshot and long-poll watch. */
 export interface DispatcherSnapshot {
-  readonly protocolVersion: 1
+  readonly protocolVersion: 2
   readonly revision: number
   readonly sessionId: string
   readonly generatedAt: number

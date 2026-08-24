@@ -3,7 +3,7 @@ import { decodeDispatcherSnapshot, DispatcherDecodeError } from '../../src/clien
 
 function validSnapshot(): Record<string, unknown> {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     revision: 4,
     sessionId: 'session-1',
     generatedAt: 1_700_000_000_000,
@@ -52,8 +52,12 @@ function validSnapshot(): Record<string, unknown> {
 }
 
 describe('decodeDispatcherSnapshot', () => {
-  it('accepts the complete exact v1 contract', () => {
-    const snapshot = decodeDispatcherSnapshot(validSnapshot(), 'session-1')
+  it('accepts the complete exact v2 contract and recursive task relation', () => {
+    const raw = validSnapshot()
+    ;(raw['tasks'] as Array<Record<string, unknown>>)[0]!['orchestration'] = {
+      parentTaskId: 'task-root', nodeId: 'inspect', depth: 1,
+    }
+    const snapshot = decodeDispatcherSnapshot(raw, 'session-1')
     expect(snapshot.revision).toBe(4)
     expect(snapshot.tasks[0]?.masterPlan?.steps[0]?.dependsOn).toEqual([])
     expect(snapshot.tasks[0]?.workers[0]).toMatchObject({
@@ -61,6 +65,9 @@ describe('decodeDispatcherSnapshot', () => {
       agentId: 'agent-1',
       provider: 'local',
       model: 'deepseek',
+    })
+    expect(snapshot.tasks[0]?.orchestration).toEqual({
+      parentTaskId: 'task-root', nodeId: 'inspect', depth: 1,
     })
   })
 
@@ -78,6 +85,20 @@ describe('decodeDispatcherSnapshot', () => {
     ;(snapshot['tasks'] as Array<Record<string, unknown>>)[0]!['distribution'] = distribution
 
     expect(decodeDispatcherSnapshot(snapshot).tasks[0]?.distribution).toEqual(distribution)
+  })
+
+  it.each([
+    ['a non-object value', null],
+    ['a missing field', { parentTaskId: 'root', nodeId: 'leaf' }],
+    ['an unknown field', { parentTaskId: 'root', nodeId: 'leaf', depth: 1, extra: true }],
+    ['an empty parent id', { parentTaskId: '', nodeId: 'leaf', depth: 1 }],
+    ['an empty node id', { parentTaskId: 'root', nodeId: '', depth: 1 }],
+    ['a root depth', { parentTaskId: 'root', nodeId: 'leaf', depth: 0 }],
+  ])('rejects orchestration relation with %s', (_label, orchestration) => {
+    const snapshot = validSnapshot()
+    ;(snapshot['tasks'] as Array<Record<string, unknown>>)[0]!['orchestration'] = orchestration
+    expect(() => decodeDispatcherSnapshot(snapshot)).toThrowError(DispatcherDecodeError)
+    expect(() => decodeDispatcherSnapshot(snapshot)).toThrow('snapshot.tasks[0].orchestration')
   })
 
   it('accepts a queued distributed task before a node or lease is assigned', () => {
@@ -135,7 +156,7 @@ describe('decodeDispatcherSnapshot', () => {
 
   it('binds replies to their requested session and exact protocol version', () => {
     expect(() => decodeDispatcherSnapshot(validSnapshot(), 'session-2')).toThrow('snapshot.sessionId')
-    expect(() => decodeDispatcherSnapshot({ ...validSnapshot(), protocolVersion: 2 })).toThrow('protocolVersion')
+    expect(() => decodeDispatcherSnapshot({ ...validSnapshot(), protocolVersion: 1 })).toThrow('protocolVersion')
   })
 
   it('rejects running as a terminal DispatcherResult status', () => {

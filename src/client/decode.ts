@@ -10,6 +10,7 @@ import {
   WORKER_STATUSES,
   type DispatcherDistribution,
   type DispatcherMasterPlan,
+  type DispatcherOrchestrationRelation,
   type DispatcherPlanStep,
   type DispatcherResult,
   type DispatcherSnapshot,
@@ -19,7 +20,7 @@ import {
 
 type AnyRecord = Record<string, unknown>
 
-/** A wire response failed the plugin's exact v1 contract. */
+/** A wire response failed the plugin's exact telemetry v2 contract. */
 export class DispatcherDecodeError extends TypeError {}
 
 function fail(path: string, expected: string): never {
@@ -164,13 +165,24 @@ function decodeDistribution(value: unknown, path: string): DispatcherDistributio
   }
 }
 
+function decodeOrchestration(value: unknown, path: string): DispatcherOrchestrationRelation {
+  const item = record(value, path)
+  exact(item, path, ['parentTaskId', 'nodeId', 'depth'])
+  return {
+    parentTaskId: string(item['parentTaskId'], `${path}.parentTaskId`),
+    nodeId: string(item['nodeId'], `${path}.nodeId`),
+    depth: integer(item['depth'], `${path}.depth`, 1),
+  }
+}
+
 function decodeTask(value: unknown, path: string): DispatcherTask {
   const item = record(value, path)
   exact(item, path, [
     'taskId', 'lane', 'title', 'status', 'phase', 'startedAt', 'updatedAt', 'workers',
-  ], ['jobId', 'finishedAt', 'distribution', 'masterPlan', 'result'])
+  ], ['jobId', 'finishedAt', 'orchestration', 'distribution', 'masterPlan', 'result'])
   const jobId = optional(item, 'jobId', string, path)
   const finishedAt = optional(item, 'finishedAt', integer, path)
+  const orchestration = optional(item, 'orchestration', decodeOrchestration, path)
   const distribution = optional(item, 'distribution', decodeDistribution, path)
   const masterPlan = optional(item, 'masterPlan', decodePlan, path)
   const result = optional(item, 'result', decodeResult, path)
@@ -184,6 +196,7 @@ function decodeTask(value: unknown, path: string): DispatcherTask {
     startedAt: integer(item['startedAt'], `${path}.startedAt`),
     updatedAt: integer(item['updatedAt'], `${path}.updatedAt`),
     ...(finishedAt === undefined ? {} : { finishedAt }),
+    ...(orchestration === undefined ? {} : { orchestration }),
     ...(distribution === undefined ? {} : { distribution }),
     ...(masterPlan === undefined ? {} : { masterPlan }),
     workers: array(item['workers'], `${path}.workers`, decodeWorker),
@@ -191,17 +204,17 @@ function decodeTask(value: unknown, path: string): DispatcherTask {
   }
 }
 
-/** Decode one exact v1 success value and bind it to the requested session. */
+/** Decode one exact v2 success value and bind it to the requested session. */
 export function decodeDispatcherSnapshot(value: unknown, expectedSessionId?: string): DispatcherSnapshot {
   const item = record(value, 'snapshot')
   exact(item, 'snapshot', ['protocolVersion', 'revision', 'sessionId', 'generatedAt', 'tasks'])
-  if (item['protocolVersion'] !== 1) fail('snapshot.protocolVersion', '1')
+  if (item['protocolVersion'] !== 2) fail('snapshot.protocolVersion', '2')
   const sessionId = string(item['sessionId'], 'snapshot.sessionId')
   if (expectedSessionId !== undefined && sessionId !== expectedSessionId) {
     fail('snapshot.sessionId', JSON.stringify(expectedSessionId))
   }
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     revision: integer(item['revision'], 'snapshot.revision'),
     sessionId,
     generatedAt: integer(item['generatedAt'], 'snapshot.generatedAt'),

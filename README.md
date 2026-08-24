@@ -1,8 +1,171 @@
 # dsh-task-dispatcher
 
-An independent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that sends bounded work to isolated child Sessions and requires independent model verification. A lane can use the original executor-to-verifier pipeline or add a read-only planner that maintains a bounded, evaluator-gated master plan. Each configured lane owns every model route, tool allow-list, retry and planning budget, timeout, and mandatory acceptance criterion. Local execution remains the default; an opt-in distributed read-only mode leases complete tasks to remote DSH workers through PostgreSQL.
+An independent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that sends bounded work to isolated child Sessions and requires independent model verification. A lane can use the original executor-to-verifier pipeline, add a read-only planner that maintains a bounded evaluator-gated master plan, or opt into Host-owned local read-only DAG orchestration. Each configured lane owns every model route, tool allow-list, retry and planning budget, timeout, and mandatory acceptance criterion. Local execution remains the default; an opt-in distributed read-only mode leases complete tasks to remote DSH workers through PostgreSQL.
 
 The parent Session stays the control plane. Execution and verification run in child Sessions, so competing models never append concurrently to the same parent Session.
+
+**Start here:** [Quickstart](#quickstart) · [Core ideas](#core-ideas) ·
+[Architecture](#architecture) · [Usage guide](#usage-guide) ·
+[Lane reference](#configure-lanes) · [Failure boundaries](#availability-and-failure-boundary)
+
+## Quickstart
+
+### 1. Add the public plugin to the Web profile
+
+Prerequisites are Node.js `^22.19.0` or `>=24.0.0`, pnpm 11, and a working
+DeepSeek Harness Web profile. The profile must already provide the standard
+agents, jobs, settings, subagents, and tools services plus the model routes
+used by your lanes.
+
+```sh
+cd /path/to/deepseek-harness
+pnpm dsh plugin --profile web add github:c4pt0r/dsh-task-dispatcher
+pnpm dsh --profile web --dump-config
+```
+
+The dump must contain one root row named `dsh-task-dispatcher`. Plugin
+installation is profile-specific; adding it to another profile does not make
+the Web client or Settings page available in `web`.
+
+### 2. Start or restart the Web Host
+
+Port 8317 is an explicit example, not a DSH default:
+
+```sh
+pnpm dsh web --port 8317
+```
+
+Open <http://127.0.0.1:8317>. Start or restart the Host after adding the plugin;
+refreshing the browser alone does not activate Host policy changes. Choose a
+different explicit port if 8317 is already in use.
+
+### 3. Inspect policy in the Web UI
+
+Open the URL printed by DSH, then go to **Settings → Plugins → Task
+Dispatcher**. The bundled `general-analysis` lane is local, planner-enabled,
+background by default, and intentionally read-only. It expects the bundled
+DeepSeek provider names to exist in the selected Harness profile. Configure a
+working credential for those routes (normally `DEEPSEEK_API_KEY`, or the
+equivalent Models setting) before the first dispatch; a provider name alone
+does not make model calls usable.
+
+### 4. Dispatch a verified task
+
+From an exact live root Session, ask naturally:
+
+```text
+Use dispatch_task with lane=general-analysis and run_in_background=true.
+Title: Review pagination.
+Objective: Review the audit-log pagination, identify concrete gaps, and verify
+the findings independently. Do not modify the workspace.
+```
+
+The tool returns a dispatcher `taskId` and a Harness `jobId`. Use
+`job_output({ job_id })` for a local background task. A completed Job means the
+pipeline stopped; inspect the task result itself for `accepted`, `rejected`,
+`blocked`, `cancelled`, or `error`.
+
+### 5. Enable dynamic DAG planning when needed
+
+Dynamic recursive orchestration is opt-in. Create a non-orchestrating,
+read-only child lane, then enable **Safe subtask orchestration** on a parent
+lane and select that child lane. Keep `maxPlanPatches > 0`, provide enough
+shared node/model-run budget, save, and restart DSH. The Host may then revise
+only the never-started part of the DAG after a fully accepted wave; completed
+nodes remain immutable. See [Host-owned recursive orchestration](#host-owned-recursive-orchestration-v1)
+for the exact v1 boundary.
+
+## Core ideas
+
+1. **Models propose; the Host owns authority.** A model may propose a plan,
+   patch, child DAG, or evidence. Only the Host selects routes, tools,
+   workspaces, budgets, leases, plan revisions, and terminal status.
+2. **Success requires independent verification.** Executor self-reports are
+   evidence, never acceptance. A distinct verifier must cover every immutable
+   criterion with a passing result and non-empty evidence.
+3. **Policy is stronger than prompt text.** Objectives cannot select a model,
+   add a tool, broaden a sandbox, change lanes, or mint recursive authority.
+   Those choices come only from deployment-owned lane configuration.
+4. **Plans are adaptive but effects are fenced.** Linear plans replace only
+   their pending suffix. Recursive DAGs replace only never-started nodes at a
+   fully joined wave boundary, after independent patch review and revision
+   compare-and-set.
+5. **Budgets decrease monotonically.** Depth, node, fan-out, concurrency,
+   model-run, attempt, deadline, output, and lease limits are checked before
+   publication. Started work never refunds model authority.
+6. **Uncertainty fails closed.** Missing structured output, stale leases,
+   invalid evidence, cleanup uncertainty, policy drift, or exhausted budgets
+   cannot become accepted. Uncertain local cleanup quarantines the workspace.
+7. **Durability is explicit, not implied.** Local plans and Jobs are
+   process-local. Distributed v1 durably leases a complete read-only task, but
+   does not checkpoint individual planner/executor/verifier phases.
+
+## Architecture
+
+```mermaid
+flowchart TB
+  User["Root Session / human request"]
+  Approval["Harness approval boundary"]
+  Settings["Settings UI<br/>restart-scoped policy"]
+  Host["Dispatcher Host control plane<br/>lane policy · budgets · locks · revisions"]
+  Telemetry["Session-scoped telemetry<br/>plan · workers · results"]
+  Web["Conversation card + Settings page"]
+
+  User -->|"dispatch_task"| Approval --> Host
+  Settings -->|"validated policy on restart"| Host
+  Host --> Telemetry --> Web
+
+  subgraph Local["Local execution"]
+    LocalShape{"Configured local lane shape"}
+    Classic["Classic pipeline<br/>executor → independent verifier"]
+    Planner["Planner"]
+    PlanReview["Independent plan reviewer"]
+    Plan["Host-owned Master Plan<br/>revision · history · CAS"]
+    Scheduler["Wave scheduler + grant ledger"]
+    ChildA["Complete fixed child-lane pipeline A"]
+    ChildB["Complete fixed child-lane pipeline B"]
+    Final["Final independent verifier"]
+    LocalResult["Criterion-gated local result"]
+
+    LocalShape -->|"planner omitted"| Classic --> LocalResult
+    LocalShape -->|"planner configured"| Planner
+    Planner --> PlanReview --> Plan
+    Plan --> Scheduler
+    Scheduler --> ChildA
+    Scheduler --> ChildB
+    ChildA -->|"bounded evidence"| Plan
+    ChildB -->|"bounded evidence"| Plan
+    Plan -->|"keep / reviewed pending-DAG patch"| Scheduler
+    Scheduler --> Final --> LocalResult
+  end
+
+  subgraph Distributed["Distributed read-only execution v1"]
+    Store[("PostgreSQL durable task + lease ledger")]
+    Worker["Remote DSH worker<br/>temporary root + complete task pipeline"]
+    Store -->|"claim · heartbeat · fenced completion"| Worker
+    Worker -->|"terminal result"| Store
+  end
+
+  Host -->|"local lane"| LocalShape
+  Host -->|"distributed lane: enqueue whole task"| Store
+  LocalResult -->|"accepted / rejected / blocked / error"| Host
+  Store -->|"durable status / cancel"| Host
+```
+
+The local and distributed paths deliberately have different recovery models.
+Local execution can expose live phases, Agents, dependencies, and dynamic plan
+revisions, but loses that in-memory state if its process dies. Distributed v1
+survives coordinator or worker replacement through PostgreSQL leases, yet a
+lost worker reruns the complete read-only task instead of resuming mid-plan.
+Writable recursive worktree primitives exist as experimental Host libraries,
+but are not connected to active lanes or remote workers.
+
+| Mode | Plan shape | Revision point | Parallelism | Durable state |
+|---|---|---|---|---|
+| Local classic | No plan: executor then verifier | Optional executor retry only | One child phase at a time | Process-local |
+| Local adaptive | Ordered Master Plan | After a verified step, replace only the pending suffix | One plan step at a time | Process-local |
+| Local orchestration | Dependency DAG | After a fully accepted wave, replace only never-started nodes | Bounded ready-wave parallelism | Process-local |
+| Distributed v1 | One worker runs the complete classic or adaptive pipeline | Inside that worker; recursive DAG is disabled | Across whole tasks/workers, not across machines within one task | Envelope, lease, cancellation, and terminal result |
 
 ## What it guarantees
 
@@ -32,12 +195,21 @@ For every `dispatch_task` call, the plugin:
 8. Repeats an executor or permits final-review remediation only when deployment
    policy explicitly enables `retryOnRevise` and the relevant attempt, patch,
    child-run, and deadline budgets still permit it.
+9. For an orchestration-enabled lane, admits child authority lazily one ready
+   wave at a time. After a fully accepted wave has joined and cleaned up, the
+   Host may ask the planner to keep the remaining DAG, report a blocker, or
+   replace only nodes that have never started. A replacement is independently
+   reviewed and committed with a compare-and-set plan revision before any new
+   child receives authority.
 
 An accepted result is **model-verified**. It is not a formal proof, a security certification, or human approval. The executor's own success claim is never sufficient for acceptance.
 
 Other safety properties include:
 
-- Root-only dispatch: subagents cannot recursively create dispatcher work.
+- Root-authorized dispatch: raw `dispatch_task` calls are accepted only from an
+  exact live root Session. An orchestration child cannot recursively dispatch
+  work itself; only the Host may create a validated descendant from an
+  orchestration proposal.
 - For local lanes, one active task per overlapping workspace tree in the
   current DSH process. Canonical parent/child paths conflict, and the
   reservation is kept in process-global state so a plugin hot reload cannot
@@ -46,15 +218,20 @@ Other safety properties include:
 - Host-generated task ids; a caller cannot choose them.
 - Host-owned master-plan identity, revision, status, evidence, and immutable
   history. Planner children can propose typed data, but cannot mutate plan
-  state. A revision patch must match the current Host revision, and completed
-  steps form an immutable prefix that cannot be replaced; removed historical
-  step ids cannot be reused, and plan reviews reject proposals that repeat
-  completed effects.
+  state. A revision patch must match the current Host revision. Completed
+  linear steps form an immutable prefix; completed orchestration nodes form an
+  immutable set. Neither can be replaced, removed historical ids cannot be
+  reused, and plan reviews reject proposals that repeat completed effects.
 - Mandatory lane criteria cannot be removed or replaced by a tool call. A caller may only add stricter criteria with new ids.
 - Bounded task text, criteria, deliverables, attempts, plan size, plan patches,
   total child runs, whole-task runtime, per-child runtime, output, cleanup, and
   job output.
 - Child tool allow-lists. An empty verifier list creates a model-only verifier.
+- Raw recursive and global-rule capabilities remain denied to executor lanes:
+  `dispatch_task`, `dispatch_status`, `dispatch_cancel`, `subagent`,
+  `subagent_fork`, `workflow`, `ralph`, `prompt_rewrite_rules`, and
+  `trigger_rules` cannot be added to an executor allow-list. Host orchestration
+  does not expose these tools to its children.
 - Planner and verifier tools are restricted to the built-in read-only set
   (`read`, `read_image`, `glob`, and `grep`); planning and verification cannot
   mutate the candidate.
@@ -77,7 +254,8 @@ produces structured evidence, then a separate verifier evaluates the complete
 task. `retryOnRevise` may repeat that executor up to `maxAttempts`; no master
 plan is created.
 
-When `planner` is configured, the pipeline is:
+When `planner` is configured on a lane without recursive orchestration, the
+pipeline is:
 
 ```text
 initial planner -> independent plan review
@@ -109,6 +287,106 @@ pending suffix after that process restarts. A local task is therefore lost with
 its process. A distributed task envelope and its eventual terminal result are
 durable, but a worker failure causes the complete task pipeline to be leased
 and run again rather than resuming its interrupted plan.
+
+## Host-owned recursive orchestration (v1)
+
+Recursive orchestration is an opt-in property of a configured lane. In v1 it
+is deliberately limited to **local, spawn-only, read-only** execution with
+`workspaceMode: read-shared`. Both the orchestration lane and its fixed
+`childLane` must run locally, use `spawn`, and expose only `read`, `read_image`,
+`glob`, and `grep`. The child lane is selected by deployment configuration,
+must be a `general` lane, and cannot add tools that the parent lane does not
+already have in the corresponding planner, executor, or verifier phase.
+`isolated-write` is present only as a reserved configuration value and is
+rejected by the Host while orchestration is enabled.
+
+The v1 dynamic-DAG lifecycle is:
+
+```mermaid
+flowchart TD
+  P["Planner proposes typed child DAG"] --> R["Independent DAG review"]
+  R --> V["Host validates scope · coverage · acyclicity · budgets"]
+  V --> W["Lazily reserve one dependency-ready wave"]
+  W --> C["Run complete fixed-lane child pipelines<br/>in bounded parallel"]
+  C --> J["Join every child · settle every grant · finish cleanup"]
+  J --> Q{"Pending nodes?"}
+  Q -->|"no"| F["Final independent root verifier"]
+  Q -->|"yes, no safe replan budget"| W
+  Q -->|"yes"| RP{"Replanner decision"}
+  RP -->|"keep"| W
+  RP -->|"blocked"| B["Blocked result"]
+  RP -->|"replace_pending"| PR["Independent patch review + revision CAS"]
+  PR -->|"accepted"| W
+  PR -->|"rejected / blocked"| X["Non-accepted result"]
+```
+
+The planner proposes typed child ids, objectives, dependencies, logical
+deliverable scope, local acceptance criteria, and coverage of the immutable
+root criteria. It does not choose a provider, model, tool, workspace, child
+lane, budget, or concurrency. The Host validates the proposal as an acyclic,
+scope-contained DAG, owns every state transition, and starts at most
+`maxConcurrentNodes` ready children at once. Each child runs the complete
+pipeline of its fixed lane and must be independently accepted before it can
+satisfy a dependency. Accepted child reports are evidence for the final root
+verifier, never automatic proof that the root task succeeded.
+
+The current DAG is Host-owned and can change between waves. A replanner runs
+only after the entire preceding wave has joined, every child grant has settled,
+and no pending node owns execution authority. It receives bounded structured
+evidence, not raw child streams. `keep` leaves the revision unchanged;
+`replace_pending` supplies the complete new never-started DAG and receives a
+separate plan review. The Host preserves every completed node byte-for-byte,
+rejects mutation of a retained pending id, forbids reuse of any removed id,
+revalidates dependencies and immutable criterion/deliverable coverage, and
+commits only if the proposed `baseRevision` still matches. The next wave is
+reserved only after that atomic plan update, so a removed node can never start
+with stale authority.
+
+Dynamic patches are optional and budgeted by `maxPlanPatches` plus the shared
+model-run ledger. Mandatory pending children and the final verifier are funded
+before optional replanning. If no safe surplus remains, the Host continues the
+reviewed DAG without starting a replanner. This v1 replans from accepted-wave
+evidence only: a failed wave still terminates or leaves dependency-blocked work
+according to `failureMode`, and a final-verifier gap does not create a new DAG.
+
+One Host-owned authority ledger is shared by the entire recursive tree. Opaque
+grants monotonically attenuate the configured depth, total task-node, per-node
+fan-out, concurrent-node, model-run, and deadline budgets. Child reservations
+are all-or-none, model runs are charged before they start, and an ancestor
+cannot settle while a descendant still owns authority. Cancellation revokes
+the grant tree; budget exhaustion, replay, expiry, policy drift, or an invalid
+proposal fails closed with a non-accepted task result. A configured child lane
+may itself be orchestration-enabled, but only within the same shared limits and
+the statically validated fixed-lane graph.
+
+This feature does not relax the root-only tool boundary. Children never receive
+raw `dispatch_task`, `dispatch_status`, `dispatch_cancel`, `subagent`,
+`subagent_fork`, `workflow`, `ralph`, `prompt_rewrite_rules`, or
+`trigger_rules` authority. Models can propose work; only the Host can mint a
+bounded child grant and start that work.
+
+Like other local master plans, the DAG, grants, live child state, and progress
+journal are process-local. V1 does not split one recursive tree across remote
+workers and cannot resume it after a Host restart.
+
+### Experimental Host libraries
+
+The package currently exports two experimental, Host-side building blocks.
+They are tested libraries, not active dispatcher capabilities:
+
+- `dsh-task-dispatcher/workspace-isolation` validates repository-relative write
+  scopes and contains path-lease and Git workspace command-planning primitives.
+  The dispatcher does not instantiate it, does not place child Sessions in its
+  worktrees, and does not integrate or promote its candidates. Writable
+  recursive orchestration therefore remains unavailable.
+- `dsh-task-dispatcher/config-proposals` contains bounded configuration-proposal,
+  approval, compare-and-set, audit, and rollback primitives. It is not wired to
+  `dispatch_task`, the Settings save path, or active lane policy. A dispatched
+  task cannot use it to persistently change configuration or global rules.
+
+Both modules require explicit trusted Host integration and may change while
+experimental. Merely importing or packaging them does not grant a model any
+tool or mutation authority.
 
 ## Distributed read-only execution (v1)
 
@@ -376,11 +654,13 @@ unreported)` and shows no invented Agent. The validated terminal result can
 include the final master plan; a durable phase-and-plan progress journal is a
 future protocol extension.
 
-The current planner contract is linear: the Host executes the first pending
-step, so each step depends on the preceding step. The wire format uses
-`dependsOn`, allowing a future DAG scheduler to expose richer dependencies
-without changing the view contract. The UI does not invent parallelism that
-the runtime does not support.
+The ordinary adaptive master-plan contract remains linear: the Host executes
+its first pending step and each step depends on the preceding step. An
+orchestration-enabled local lane instead publishes its validated DAG and the
+Host may run a bounded dependency-ready wave in parallel. The view renders the
+reported `dependsOn` edges and active Agents for either shape; it does not
+invent dependencies, workers, or parallelism that Host telemetry did not
+report.
 
 The Host publishes bounded, session-filtered snapshots through a loopback-only
 RPC channel. The browser takes a baseline snapshot and then uses
@@ -398,7 +678,9 @@ exact origin Session when the durable ledger is the source of truth.
 Open **Settings → Plugins → Task Dispatcher** to edit the complete dispatcher
 policy without hand-writing YAML. The page covers global defaults, lane model
 routes and tool allow-lists, planning and retry budgets, acceptance criteria,
-execution placement, and distributed roles, pools, and workspace mappings.
+local read-only orchestration, execution placement, and distributed roles,
+pools, and workspace mappings. The reserved `isolated-write` orchestration
+choice is labelled unavailable and the Host refuses to activate it.
 
 Saving writes the `dsh-task-dispatcher` user section to the Harness settings
 document (by default `$DSH_HOME/settings.yaml`). It does **not** hot-swap the
@@ -438,7 +720,24 @@ before an editable scope exists; repair that section manually. Malformed YAML
 syntax is a separate document-level error that may prevent the Settings service
 from loading before this plugin starts and also requires manual repair.
 
-## Install locally
+## Usage guide
+
+Use a classic lane for one bounded executor/verifier exchange, an adaptive lane
+for an ordered task whose remaining steps may change, and an orchestration lane
+for a local read-only DAG with bounded parallel waves. Use distributed mode
+only when complete read-only tasks need durable queueing or placement across
+workers. Lane selection never overrides the policy configured for that lane.
+
+Before dispatching, verify that:
+
+- the caller is the exact live root Session for the intended workspace;
+- the selected lane's provider routes exist in that Harness profile;
+- the lane's tool allow-lists are sufficient but no broader than required;
+- mutating work uses an exact `workspace-write` sandbox and protected
+  `liveRoot`; and
+- Settings changes have been saved and the DSH Host has been restarted.
+
+### Install locally
 
 Install and test this project, then add its absolute path to a DSH profile that already provides the standard agents, jobs, settings, subagents, and tools services:
 
@@ -466,12 +765,20 @@ Cordis row name.
 
 Harness supplies the optional Cordis and Web-client peer modules named by the
 bundle. The repository commits its generated `lib/client.js` artifacts, so a
-Git or file dependency does not need a compiler or a globally installed pnpm
-during installation. Maintainers must run the bundle command and tests before committing;
-`npm publish` also rebuilds the client through the package's
-`prepublishOnly` gate. Run the documented bundle command before a local `npm pack`.
+Git or file dependency does not run a package build or require compiler/dev
+dependencies during installation. The DSH plugin-management command itself
+invokes pnpm, so pnpm must still be available in `PATH`. Maintainers must run
+the bundle command and tests before committing; `npm publish` also rebuilds the
+client through the package's `prepublishOnly` gate. Run the documented bundle
+command before a local `npm pack`.
 
-The bundled `general-analysis` lane is ready for the local `dsh-ds4` provider mapping, enables the master-plan pipeline, and is intentionally read-only. The checked-in bundle deliberately leaves `distribution` disabled and this lane in the default local execution mode:
+The bundled `general-analysis` lane targets the `deepseek-official` provider
+route names, enables the master-plan pipeline, and is intentionally read-only.
+Those routes may be supplied by the normal DeepSeek provider. To use the
+optional local `dsh-ds4` mapping, install and configure that bundle separately,
+run its local server, and provide its nominal `DS4_LOCAL_API_KEY`; `dsh-ds4` is
+not a dependency of this package. The checked-in bundle deliberately leaves
+`distribution` disabled and this lane in the default local execution mode:
 
 - planner: `deepseek-official/deepseek-v4-flash` with 12,000 tokens
 - executor: `deepseek-official/deepseek-v4-pro`
@@ -485,7 +792,7 @@ The bundled `general-analysis` lane is ready for the local `dsh-ds4` provider ma
 
 The configured tool names are an upper bound. Child execution still follows the Harness sandbox and delegated-child approval policy; a child cannot escalate its own permissions.
 
-## Dispatch a task
+### Dispatch a task
 
 Ask naturally from an exact live root Session, for example:
 
@@ -506,8 +813,8 @@ The corresponding tool input is:
   "objective": "Review pagination for the audit log and identify concrete gaps and tests.",
   "context": "Preserve the existing response shape.",
   "deliverables": [
-    { "id": "implementation", "description": "Pagination implementation" },
-    { "id": "tests", "description": "Focused regression tests" }
+    { "id": "findings", "description": "Concrete review findings" },
+    { "id": "test-plan", "description": "Focused test recommendations" }
   ],
   "acceptance_criteria": [
     { "id": "empty-page", "text": "A page after the final result returns an empty list." }
@@ -518,11 +825,43 @@ The corresponding tool input is:
 
 Only `lane`, `title`, and `objective` are required. `run_in_background` defaults to the deployment's `defaultRunInBackground`, which is `true` in the bundled profile.
 
-Local foreground results have `kind: "foreground"` and a task status of `accepted`, `rejected`, `blocked`, `cancelled`, or `error`. They include `failureClass` (`none`, `task`, or `infrastructure`), executor and verifier child run ids, and reports. Planner-enabled results additionally include planner runs, plan-review runs, and the Host-owned `masterPlan` with its revision and history. A local background dispatch returns a `taskId` and `jobId` immediately; use the standard `job_output`, `job_list`, and `job_kill` tools to inspect or cancel it. A distributed dispatch instead returns `kind: "distributed"`, a durable `taskId`, and `queued`, `running`, or `terminal` state; use `dispatch_status` and `dispatch_cancel` rather than Jobs.
+#### Follow or cancel the task
 
-At the Jobs layer, a finished `rejected` or `blocked` task is still a completed job—the task's JSON output contains the semantic result. Only dispatcher infrastructure errors fail the job, and cancellation kills it.
+| Dispatch kind | Initial identity | Inspect progress/result | Cancel |
+|---|---|---|---|
+| Local foreground | `taskId` in the returned result | The tool waits for the terminal result | Cancel the calling turn |
+| Local background | `taskId` plus Harness `jobId` | `job_list`, then `job_output({ job_id })` | `job_kill({ job_id })` |
+| Distributed | Durable `taskId` | `dispatch_status({ task_id })` | `dispatch_cancel({ task_id })` |
 
-## Configure lanes
+Cancellation is cooperative: it revokes authority and starts bounded cleanup.
+Read the Job output or distributed status again to confirm the terminal state;
+a cancel request is not an immediate process kill.
+
+Local foreground results have `kind: "foreground"` and a task status of
+`accepted`, `rejected`, `blocked`, `cancelled`, or `error`. They include
+`failureClass` (`none`, `task`, or `infrastructure`), executor and verifier
+child run ids, and reports. Planner-enabled results additionally include
+planner runs, plan-review runs, and the Host-owned `masterPlan` with its
+revision and history. A distributed dispatch instead returns
+`kind: "distributed"` and `queued`, `running`, or `terminal` state.
+
+#### Interpret the result
+
+- `accepted` plus `modelVerified: true` means the applicable independent
+  verifier passed every immutable criterion with evidence.
+- `rejected` means a verifier or plan reviewer rejected the proposal, evidence,
+  or result; an executor may not have started.
+- `blocked` means the pipeline reported a concrete blocker.
+- `cancelled` means the authority chain was cancelled and cleaned up.
+- `error` means a task or infrastructure boundary failed; inspect
+  `failureClass`, `message`, and `workspaceQuarantined`.
+
+At the Jobs layer, a finished `rejected` or `blocked` task is still a completed
+job—the task's JSON output contains the semantic result. Only dispatcher
+infrastructure errors fail the job, and a successful cooperative cancellation
+settles the background job as killed.
+
+### Configure lanes
 
 Lanes are deployment policy, not model-controlled input. The model calling `dispatch_task` selects only one of the configured lane ids; it cannot supply a provider, model, token budget, tools, timeout, or retry count.
 
@@ -541,7 +880,7 @@ The complete plugin-level settings are:
 | `maxConsecutiveFailures` | `3` | Infrastructure errors before a local lane's process-local circuit opens. |
 | `circuitCooldownMs` | `300000` | How long an open circuit rejects new work. |
 | `jobOutputLimitBytes` | `131072` | Maximum background Job output retained by Harness. |
-| `liveRoot` | empty | Absolute live checkout root required by self-improvement lanes. |
+| `liveRoot` | empty | Absolute protected live root required whenever an executor allow-list contains a tool outside `read`, `read_image`, `glob`, and `grep`; its task workspace must be disjoint. |
 | `stagingRoot` | empty | Absolute staging root required by self-improvement lanes. |
 | `distribution` | `{ role: disabled }` | PostgreSQL whole-task distribution settings; see the table below. |
 
@@ -571,12 +910,13 @@ Each lane supports:
 | `kind` | `general` | `general` or guarded `self-improvement`. |
 | `transport` | `spawn` | `spawn` or `fork` child-session transport. |
 | `execution` | `{ mode: local, pool: default, workspaceRef: "" }` | Local execution, or a distributed pool plus immutable worker workspace reference. |
+| `orchestration` | `{ enabled: false }` | Optional Host-owned local read-only recursive DAG policy; see the table below. |
 | `executor` | required | `{ provider, model, maxTokens }` executor route. |
 | `verifier` | required | `{ provider, model, maxTokens }` verifier route. |
 | `planner` | omitted | Optional `{ provider, model, maxTokens }` route. Omit it to retain the original executor-to-verifier pipeline. |
 | `plannerTools` | `[]` | Planner allow-list; only `read`, `read_image`, `glob`, and `grep` are accepted. Empty means model-only. |
 | `maxPlanSteps` | `6` | Maximum completed-plus-pending steps in a planner-managed plan; configurable from 1 through 8. |
-| `maxPlanPatches` | `4` | Maximum committed `replace_pending` revisions; configurable from 0 through 8. |
+| `maxPlanPatches` | `4` | Maximum committed `replace_pending` revisions for a linear plan or orchestration DAG; configurable from 0 through 8. |
 | `maxTotalChildRuns` | `32` | Hard aggregate budget for planner, plan-review, executor, step-verifier, and final-verifier children; configurable from 5 through 32. |
 | `taskTimeoutMs` | `3600000` | Planner-enabled whole-pipeline deadline, from 1 second through 6 hours; legacy lanes retain their per-child deadlines. |
 | `retryOnRevise` | `false` | Permit a verifier `revise` decision to run the executor again. Enable only for idempotent work. |
@@ -586,6 +926,85 @@ Each lane supports:
 | `executorTools` | no tools when omitted | Explicit executor tool allow-list. |
 | `verifierTools` | `[]` | Explicit verifier tool allow-list; empty means model-only. |
 
+Recursive orchestration settings are:
+
+| Field | Default | Meaning |
+|---|---:|---|
+| `enabled` | `false` | Enable Host-owned recursive DAG planning for this lane. |
+| `childLane` | empty | Fixed deployment-owned lane used for every immediate child. Required when enabled. |
+| `maxDepth` | `2` | Shared recursive depth ceiling, from 1 through 4. |
+| `maxTaskNodes` | `16` | Shared node budget for the complete tree, from 1 through 32. |
+| `maxChildrenPerNode` | `4` | Maximum immediate fan-out at one node, from 1 through 8. |
+| `maxConcurrentNodes` | `4` | Maximum active nodes in the complete tree and maximum ready-wave width, from 1 through 8. |
+| `maxTotalModelRuns` | `48` | Shared model-run credits for every planner, reviewer, child pipeline, and final verifier, from 1 through 128; an enabled lane must fund its complete minimum verified path. |
+| `maxResultBytes` | `131072` | Maximum joined child evidence and orchestration result size, from 4,096 through 1,048,576 bytes. |
+| `workspaceMode` | `read-shared` | V1 accepts only `read-shared`; `isolated-write` is reserved and rejected. |
+| `failureMode` | `fail-fast` | `fail-fast` cancels a ready wave after a failure; `collect` waits for the wave and reports failed or dependency-blocked work. |
+
+Enabling orchestration requires a planner route. The parent and fixed child
+lanes must both be local `spawn` lanes, all of their tools must be read-only,
+and the child must be `general` with phase-by-phase tool authority no broader
+than its parent. The Host also rejects fixed-child cycles and configurations
+whose shared node or model-run budget cannot fund one complete verified leaf
+path. These are activation-time policy checks, not instructions that a planner
+can override.
+
+#### Enable a dynamic read-only Master Plan
+
+The Web form is the recommended editor. For a deployment-owned base or a
+carefully managed `$DSH_HOME/settings.yaml`, the following illustrates the two
+lane roles. The leaf executes one verified unit; the parent owns the dynamic
+DAG and may replace never-started nodes after a successful wave.
+
+```yaml
+dsh-task-dispatcher:
+  lanes:
+    analysis-leaf:
+      name: Verified analysis leaf
+      kind: general
+      transport: spawn
+      execution: { mode: local }
+      executor: { provider: deepseek-official, model: deepseek-v4-pro, maxTokens: 32000 }
+      verifier: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+      executorTools: [read, glob, grep]
+      verifierTools: [read, glob, grep]
+      requiredCriteria:
+        - id: leaf-evidence
+          text: The assigned child objective is addressed with concrete evidence.
+
+    analysis-orchestrator:
+      name: Dynamic analysis DAG
+      kind: general
+      transport: spawn
+      execution: { mode: local }
+      planner: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+      executor: { provider: deepseek-official, model: deepseek-v4-pro, maxTokens: 32000 }
+      verifier: { provider: deepseek-official, model: deepseek-v4-flash, maxTokens: 12000 }
+      plannerTools: [read, glob, grep]
+      executorTools: [read, glob, grep]
+      verifierTools: [read, glob, grep]
+      maxPlanPatches: 2
+      taskTimeoutMs: 3600000
+      requiredCriteria:
+        - id: requirements
+          text: All root requirements are addressed with concrete evidence.
+      orchestration:
+        enabled: true
+        childLane: analysis-leaf
+        maxDepth: 2
+        maxTaskNodes: 8
+        maxChildrenPerNode: 4
+        maxConcurrentNodes: 2
+        maxTotalModelRuns: 32
+        maxResultBytes: 131072
+        workspaceMode: read-shared
+        failureMode: fail-fast
+```
+
+Save and restart the Host, then dispatch with
+`lane=analysis-orchestrator`. The fixed child-lane graph must remain acyclic;
+all orchestration phases are local, `spawn`, and read-only in v1.
+
 Provider and model names must match routes available in the installed Harness profile. A lane should normally use different executor and verifier models, or at minimum separate child runs, to reduce correlated self-review.
 
 Every configured route accepts 1 through 1,000,000 `maxTokens` and defaults to
@@ -593,11 +1012,14 @@ Every configured route accepts 1 through 1,000,000 `maxTokens` and defaults to
 each planner, plan reviewer, executor, step verifier, and final verifier start
 consumes one slot. Budget exhaustion fails closed with a non-accepted result.
 
-Any lane whose executor can mutate the workspace must configure `liveRoot`;
-otherwise plugin policy validation fails closed. Revision retries are disabled
-by default because a second executor run can repeat shell, network, publish, or
-other external side effects. Enable `retryOnRevise` only when the complete task
-is idempotent, not merely because file edits are usually repeatable.
+For policy validation, every executor tool outside `read`, `read_image`,
+`glob`, and `grep` is conservatively treated as potentially mutating. Such a
+lane must configure `liveRoot`, and its task workspace must resolve outside
+that protected root; otherwise policy validation fails closed. Revision retries
+are disabled by default because a second executor run can repeat shell,
+network, publish, or other external side effects. Enable `retryOnRevise` only
+when the complete task is idempotent, not merely because file edits are usually
+repeatable.
 
 Every mutating lane also requires the parent Session to use
 `workspace-write`, with the sandbox workspace root resolving exactly to the
@@ -758,6 +1180,11 @@ These layers make task failures non-fatal and let a supervisor recover process o
   a planner-enabled task share a hard configurable budget of 5-32; the bundled
   lane uses the hard maximum, 32. Patch rationale is capped at 4,000 characters
   and a plan review can report at most 8 issues.
+- Recursive orchestration v1 is local and read-only. Its configured depth is
+  1-4, complete-tree node budget 1-32, per-node fan-out 1-8, complete-tree
+  concurrency 1-8, model-run budget 1-128, and joined result limit
+  4,096-1,048,576 bytes. Activation additionally requires enough nodes and
+  model runs for a complete independently verified leaf path.
 - `taskTimeoutMs` is 1 second through 6 hours. `childTimeoutMs` is 1 second
   through 1 hour and applies separately to every planner, reviewer, executor,
   and verifier child.
@@ -777,7 +1204,7 @@ These layers make task failures non-fatal and let a supervisor recover process o
 - Terminal PostgreSQL rows are durable and are not automatically pruned by the
   plugin. Apply an operator-owned retention or archival policy only after the
   corresponding Session no longer needs status lookup.
-- The Web read-model retains at most 20 recent terminal tasks per Session and
+- The Web read-model retains at most 32 recent terminal tasks per Session and
   200 globally for one hour; active tasks are never evicted.
 - One coordinator process live-monitors at most 32 distributed tasks. Tasks
   above that live-view limit remain durable and owner-queryable with

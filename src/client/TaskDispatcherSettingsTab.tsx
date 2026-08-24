@@ -378,6 +378,77 @@ function LaneEditor(props: {
           />
         </div>
 
+        <h4>{props.t('settings.orchestration.title')}</h4>
+        <CheckField
+          id={`${uid}-orchestration-enabled`}
+          label={props.t('settings.orchestration.enabled')}
+          hint={props.t('settings.orchestration.enabledHint')}
+          checked={props.lane.orchestration.enabled}
+          disabled={props.disabled}
+          onChange={checked => { props.edit(lane => { lane.orchestration.enabled = checked }) }}
+        />
+        <div className={css.grid3}>
+          <TextField
+            id={`${uid}-orchestration-child-lane`}
+            label={props.t('settings.orchestration.childLane')}
+            value={props.lane.orchestration.childLane}
+            disabled={props.disabled || !props.lane.orchestration.enabled}
+            error={error(`${root}.orchestration.childLane`)}
+            onChange={value => { props.edit(lane => { lane.orchestration.childLane = value }) }}
+          />
+          <SelectField
+            id={`${uid}-orchestration-workspace-mode`}
+            label={props.t('settings.orchestration.workspaceMode')}
+            value={props.lane.orchestration.workspaceMode}
+            disabled={props.disabled || !props.lane.orchestration.enabled}
+            error={error(`${root}.orchestration.enabled`)}
+            options={[
+              { value: 'read-shared', label: props.t('settings.orchestration.readShared') },
+            ]}
+            onChange={value => {
+              props.edit(lane => {
+                lane.orchestration.workspaceMode = value as DispatcherLaneConfig['orchestration']['workspaceMode']
+              })
+            }}
+          />
+          <SelectField
+            id={`${uid}-orchestration-failure-mode`}
+            label={props.t('settings.orchestration.failureMode')}
+            value={props.lane.orchestration.failureMode}
+            disabled={props.disabled || !props.lane.orchestration.enabled}
+            options={[
+              { value: 'fail-fast', label: props.t('settings.orchestration.failFast') },
+              { value: 'collect', label: props.t('settings.orchestration.collect') },
+            ]}
+            onChange={value => {
+              props.edit(lane => {
+                lane.orchestration.failureMode = value as DispatcherLaneConfig['orchestration']['failureMode']
+              })
+            }}
+          />
+          {([
+            ['maxDepth', 'settings.orchestration.maxDepth', 1, 4],
+            ['maxTaskNodes', 'settings.orchestration.maxTaskNodes', 1, 32],
+            ['maxChildrenPerNode', 'settings.orchestration.maxChildrenPerNode', 1, 8],
+            ['maxConcurrentNodes', 'settings.orchestration.maxConcurrentNodes', 1, 8],
+            ['maxTotalModelRuns', 'settings.orchestration.maxTotalModelRuns', 1, 128],
+            ['maxResultBytes', 'settings.orchestration.maxResultBytes', 4_096, 1_048_576],
+          ] as const).map(([key, label, min, max]) => (
+            <NumberField
+              key={key}
+              id={`${uid}-orchestration-${key}`}
+              label={props.t(label)}
+              value={props.lane.orchestration[key]}
+              min={min}
+              max={max}
+              disabled={props.disabled || !props.lane.orchestration.enabled}
+              error={error(`${root}.orchestration.${key}`)}
+              onChange={value => { props.edit(lane => { lane.orchestration[key] = value }) }}
+            />
+          ))}
+        </div>
+        <p className={css.hint}>{props.t('settings.orchestration.safetyHint')}</p>
+
         <h4>{props.t('settings.lane.tools')}</h4>
         <div className={css.grid3}>
           {(['executorTools', 'plannerTools', 'verifierTools'] as const).map((key) => (

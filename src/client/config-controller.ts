@@ -17,11 +17,16 @@ const REF = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}$/u
 const TOOL = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/u
 const ENV = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u
 const READ_ONLY = new Set(['read', 'read_image', 'glob', 'grep'])
+const RAW_DELEGATION = new Set([
+  'dispatch_task', 'dispatch_status', 'dispatch_cancel', 'subagent', 'subagent_fork',
+  'workflow', 'ralph', 'prompt_rewrite_rules', 'trigger_rules',
+])
 
 export type DispatcherValidationCode =
   | 'required' | 'trimmed' | 'invalid-id' | 'invalid-env' | 'range' | 'duplicate'
   | 'absolute-path' | 'criteria-required' | 'read-only-tools' | 'distribution-required'
   | 'mapping-required' | 'heartbeat' | 'max-lanes' | 'overlap' | 'invalid-config'
+  | 'unsafe-tool' | 'orchestration'
 
 export type DispatcherValidationErrors = Record<string, DispatcherValidationCode>
 
@@ -54,6 +59,26 @@ function route(errors: DispatcherValidationErrors, path: string, value: Dispatch
   nonEmpty(errors, `${path}.provider`, value.provider)
   nonEmpty(errors, `${path}.model`, value.model)
   range(errors, `${path}.maxTokens`, value.maxTokens, 1, 1_000_000)
+}
+
+function minimumLaneExecutionCost(
+  laneId: string,
+  lanes: Readonly<Record<string, DispatcherLaneConfig>>,
+  remainingDepth: number,
+  visiting = new Set<string>(),
+): { nodes: number; modelRuns: number } {
+  const lane = lanes[laneId]
+  if (lane === undefined) throw new TypeError('unknown child lane')
+  if (!lane.orchestration.enabled) {
+    return { nodes: 1, modelRuns: lane.planner === undefined ? 2 : 5 }
+  }
+  if (visiting.has(laneId)) throw new TypeError('orchestration lane cycle')
+  const depth = Math.min(remainingDepth, lane.orchestration.maxDepth)
+  if (depth < 1) throw new TypeError('orchestration depth cannot reach a leaf lane')
+  const next = new Set(visiting)
+  next.add(laneId)
+  const child = minimumLaneExecutionCost(lane.orchestration.childLane, lanes, depth - 1, next)
+  return { nodes: child.nodes + 1, modelRuns: child.modelRuns + 3 }
 }
 
 /** Browser-side fast feedback. The Host remains authoritative on save. */
@@ -122,6 +147,9 @@ export function validateDispatcherDraft(config: DispatcherPolicyConfig): Dispatc
     if (lane.verifierTools.some(tool => !READ_ONLY.has(tool))) {
       errors[`${root}.verifierTools`] = 'read-only-tools'
     }
+    if ((lane.executorTools ?? []).some(tool => RAW_DELEGATION.has(tool))) {
+      errors[`${root}.executorTools`] = 'unsafe-tool'
+    }
     range(errors, `${root}.maxPlanSteps`, lane.maxPlanSteps, 1, 8)
     range(errors, `${root}.maxPlanPatches`, lane.maxPlanPatches, 0, 8)
     range(errors, `${root}.maxTotalChildRuns`, lane.maxTotalChildRuns, 5, 32)
@@ -146,7 +174,7 @@ export function validateDispatcherDraft(config: DispatcherPolicyConfig): Dispatc
       errors[`${root}.kind`] = 'absolute-path'
     }
     if ((lane.executorTools ?? []).some(tool => !READ_ONLY.has(tool)) && config.liveRoot === '') {
-      errors[`${root}.executorTools`] = 'absolute-path'
+      errors[`${root}.executorTools`] ??= 'absolute-path'
       errors['liveRoot'] = 'absolute-path'
     }
     if (lane.execution.mode === 'distributed') {
@@ -157,11 +185,66 @@ export function validateDispatcherDraft(config: DispatcherPolicyConfig): Dispatc
       const distributedTools = [
         ...(lane.executorTools ?? []), ...lane.plannerTools, ...lane.verifierTools,
       ]
-      if (distributedTools.some(tool => !READ_ONLY.has(tool))) errors[`${root}.executorTools`] = 'read-only-tools'
+      if (distributedTools.some(tool => !READ_ONLY.has(tool))) {
+        if (errors[`${root}.executorTools`] !== 'unsafe-tool') {
+          errors[`${root}.executorTools`] = 'read-only-tools'
+        }
+      }
       if ((distribution.role === 'worker' || distribution.role === 'hybrid')
         && distribution.workspaceMappings[lane.execution.workspaceRef] === undefined) {
         errors[`${root}.execution.workspaceRef`] = 'mapping-required'
       }
+    }
+    const orchestration = lane.orchestration
+    range(errors, `${root}.orchestration.maxDepth`, orchestration.maxDepth, 1, 4)
+    range(errors, `${root}.orchestration.maxTaskNodes`, orchestration.maxTaskNodes, 1, 32)
+    range(errors, `${root}.orchestration.maxChildrenPerNode`, orchestration.maxChildrenPerNode, 1, 8)
+    range(errors, `${root}.orchestration.maxConcurrentNodes`, orchestration.maxConcurrentNodes, 1, 8)
+    range(errors, `${root}.orchestration.maxTotalModelRuns`, orchestration.maxTotalModelRuns, 1, 128)
+    range(errors, `${root}.orchestration.maxResultBytes`, orchestration.maxResultBytes, 4_096, 1_048_576)
+    if (orchestration.maxChildrenPerNode > orchestration.maxTaskNodes - 1
+      || orchestration.maxConcurrentNodes > orchestration.maxTaskNodes) {
+      errors[`${root}.orchestration.enabled`] = 'orchestration'
+    }
+    if (orchestration.enabled) {
+      const childLane = config.lanes[orchestration.childLane]
+      if (!ID.test(orchestration.childLane) || childLane === undefined) {
+        errors[`${root}.orchestration.childLane`] = 'orchestration'
+      } else {
+        const localSpawn = lane.execution.mode === 'local' && childLane.execution.mode === 'local'
+          && lane.transport === 'spawn' && childLane.transport === 'spawn'
+        const parentReadOnly = [
+          ...(lane.executorTools ?? []), ...lane.plannerTools, ...lane.verifierTools,
+        ].every(tool => READ_ONLY.has(tool))
+        const childReadOnly = [
+          ...(childLane.executorTools ?? []), ...childLane.plannerTools, ...childLane.verifierTools,
+        ].every(tool => READ_ONLY.has(tool))
+        if (lane.planner === undefined || orchestration.maxTotalModelRuns < 5
+          || !localSpawn || !parentReadOnly || !childReadOnly || childLane.kind !== 'general'
+          || orchestration.workspaceMode !== 'read-shared') {
+          errors[`${root}.orchestration.enabled`] = 'orchestration'
+        }
+        const childSets = [childLane.executorTools ?? [], childLane.plannerTools, childLane.verifierTools]
+        const parentSets = [lane.executorTools ?? [], lane.plannerTools, lane.verifierTools]
+        if (childSets.some((set, index) => set.some(tool => !new Set(parentSets[index]).has(tool)))) {
+          errors[`${root}.orchestration.childLane`] = 'orchestration'
+        }
+      }
+    } else if (orchestration.childLane !== '') {
+      errors[`${root}.orchestration.childLane`] = 'orchestration'
+    }
+  }
+  for (const [id, lane] of laneEntries) {
+    if (!lane.orchestration.enabled) continue
+    const root = `lanes.${id}.orchestration`
+    try {
+      const minimum = minimumLaneExecutionCost(id, config.lanes, lane.orchestration.maxDepth)
+      if (minimum.nodes > lane.orchestration.maxTaskNodes
+        || minimum.modelRuns > lane.orchestration.maxTotalModelRuns) {
+        errors[`${root}.enabled`] = 'orchestration'
+      }
+    } catch {
+      errors[`${root}.childLane`] = 'orchestration'
     }
   }
   return errors

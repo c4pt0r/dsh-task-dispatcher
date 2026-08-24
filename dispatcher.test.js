@@ -14,13 +14,20 @@ import {
   MASTER_PLAN_RESULT_SCHEMA,
   PLAN_PATCH_OUTPUT_SCHEMA,
   PLAN_REVIEW_OUTPUT_SCHEMA,
+  SUBTASK_PLAN_PATCH_OUTPUT_SCHEMA,
+  SUBTASK_PLAN_OUTPUT_SCHEMA,
   VERIFIER_OUTPUT_SCHEMA,
   acceptanceGate,
   apply,
   applyPlanPatch,
+  applySubtaskPlanPatch,
   assertExactDispatcherConfig,
   assertSafeWorkspace,
+  buildExecutorPrompt,
+  buildPlannerPrompt,
   buildPlanReviewPrompt,
+  buildPlanStepExecutorPrompt,
+  buildSubtaskPlannerPrompt,
   createDispatcherTelemetry,
   createDispatcherTelemetryRpcHandler,
   createDispatcherTool,
@@ -40,6 +47,7 @@ import {
   parseDispatcherTelemetryRpcPayload,
   parseInitialPlan,
   parsePlanPatch,
+  parseSubtaskPlanPatch,
   registerDispatcherTelemetryRpc,
   resolveDispatcherConfig,
   runStructuredChild,
@@ -48,6 +56,7 @@ import {
   watchDispatcherTelemetry,
 } from './dispatcher.js'
 import { MemoryTaskStore } from './distributed-store.js'
+import { OrchestrationGrantLedger } from './orchestration.js'
 
 function lane(overrides = {}) {
   return {
@@ -271,6 +280,16 @@ test('configuration resolves defaults and enforces cross-field policy', async (t
       pattern: /duplicate tool name/u,
     },
     {
+      name: 'raw recursive executor tool',
+      value: { lanes: { code: lane({ executorTools: ['read', 'workflow'] }) } },
+      pattern: /cannot expose raw orchestration/u,
+    },
+    {
+      name: 'raw global rule mutation tool',
+      value: { lanes: { code: lane({ executorTools: ['read', 'trigger_rules'] }) } },
+      pattern: /cannot expose raw orchestration or global-rule tool/u,
+    },
+    {
       name: 'missing self-improvement roots',
       value: { lanes: { improve: lane({ kind: 'self-improvement' }) } },
       pattern: /requires disjoint liveRoot and stagingRoot/u,
@@ -327,6 +346,95 @@ test('configuration resolves defaults and enforces cross-field policy', async (t
       assert.throws(() => resolveDispatcherConfig(example.value), example.pattern)
     })
   }
+})
+
+test('orchestration policy is fixed-lane, local, spawn-only, read-only, and attenuating', () => {
+  const readLane = (overrides = {}) => lane({
+    planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 4_000 },
+    executorTools: ['read', 'grep'],
+    plannerTools: ['read'],
+    verifierTools: ['read'],
+    maxAttempts: 1,
+    ...overrides,
+  })
+  const resolved = resolveDispatcherConfig({
+    lanes: {
+      child: readLane(),
+      root: readLane({ orchestration: { enabled: true, childLane: 'child' } }),
+    },
+  })
+  assert.deepEqual(resolved.lanes.root.orchestration, {
+    enabled: true,
+    childLane: 'child',
+    maxDepth: 2,
+    maxTaskNodes: 16,
+    maxChildrenPerNode: 4,
+    maxConcurrentNodes: 4,
+    maxTotalModelRuns: 48,
+    maxResultBytes: 131_072,
+    workspaceMode: 'read-shared',
+    failureMode: 'fail-fast',
+  })
+
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: { root: readLane({ orchestration: { enabled: true, childLane: 'missing' } }) },
+  }), /unknown childLane/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      child: readLane(),
+      root: readLane({
+        orchestration: { enabled: true, childLane: 'child', maxTaskNodes: 1, maxChildrenPerNode: 1 },
+      }),
+    },
+  }), /maxChildrenPerNode|maxTaskNodes/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      child: readLane(),
+      root: readLane({
+        orchestration: { enabled: true, childLane: 'child', maxTotalModelRuns: 7 },
+      }),
+    },
+  }), /at least 8 model runs/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      a: readLane({ orchestration: { enabled: true, childLane: 'b' } }),
+      b: readLane({ orchestration: { enabled: true, childLane: 'a' } }),
+    },
+  }), /contains a cycle/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      leaf: readLane(),
+      branch: readLane({ orchestration: { enabled: true, childLane: 'leaf' } }),
+      root: readLane({ orchestration: { enabled: true, childLane: 'branch', maxDepth: 1 } }),
+    },
+  }), /cannot reach a non-orchestrating leaf/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      child: readLane({ executorTools: ['read', 'grep'] }),
+      root: readLane({
+        executorTools: ['read'],
+        orchestration: { enabled: true, childLane: 'child' },
+      }),
+    },
+  }), /cannot add tool/u)
+  assert.throws(() => resolveDispatcherConfig({
+    liveRoot: dirname(realpathSync.native(process.execPath)),
+    lanes: {
+      child: readLane(),
+      root: readLane({
+        executorTools: ['read', 'write'],
+        orchestration: { enabled: true, childLane: 'child' },
+      }),
+    },
+  }), /must be read-only/u)
+  assert.throws(() => resolveDispatcherConfig({
+    lanes: {
+      child: readLane(),
+      root: readLane({
+        orchestration: { enabled: true, childLane: 'child', workspaceMode: 'isolated-write' },
+      }),
+    },
+  }), /isolated-write mode is not enabled/u)
 })
 
 test('configuration RPC is strict, restart-scoped, minimal, and revision fenced', async () => {
@@ -884,6 +992,163 @@ test('master-plan APIs preserve atomicity, revision ownership, and immutable his
   assert.deepEqual([...seenStepIds], seenBeforeStaleApply)
 })
 
+test('orchestration patch APIs protect completed nodes and replace only a valid pending DAG', () => {
+  const childLane = lane({
+    executorTools: ['read'],
+    verifierTools: ['read'],
+    plannerTools: [],
+    planner: undefined,
+    maxAttempts: 1,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'],
+        verifierTools: ['read'],
+        plannerTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 6,
+          maxChildrenPerNode: 4,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 16,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    deliverables: [{ id: 'artifact', description: 'Bounded artifact.' }],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const completed = {
+    id: 'inspect',
+    title: 'Inspect',
+    objective: 'Inspect the artifact.',
+    dependsOn: [],
+    scope: ['artifact'],
+    acceptanceCriteria: [{ id: 'inspect-ok', text: 'Inspection has evidence.' }],
+    covers: ['requirements'],
+  }
+  const pending = {
+    id: 'old-followup',
+    title: 'Old follow-up',
+    objective: 'Check the original assumption.',
+    dependsOn: ['inspect'],
+    scope: [],
+    acceptanceCriteria: [{ id: 'old-ok', text: 'Original assumption is checked.' }],
+    covers: [],
+  }
+  const currentTasks = [completed, pending]
+  const plan = {
+    planId: 'plan-task-1',
+    taskId: spec.taskId,
+    revision: 3,
+    patchCount: 0,
+    status: 'active',
+    summary: 'Inspect, then adapt.',
+    steps: [
+      {
+        id: completed.id,
+        title: completed.title,
+        objective: completed.objective,
+        acceptanceCriteria: structuredClone(completed.acceptanceCriteria),
+        covers: [...completed.covers],
+        deliverableIds: [...completed.scope],
+        dependsOn: [],
+        status: 'completed',
+        attempts: 1,
+        evidence: [{ id: 'requirements', status: 'pass', evidence: 'Inspected.' }],
+      },
+      {
+        id: pending.id,
+        title: pending.title,
+        objective: pending.objective,
+        acceptanceCriteria: structuredClone(pending.acceptanceCriteria),
+        covers: [],
+        deliverableIds: [],
+        dependsOn: ['inspect'],
+        status: 'pending',
+        attempts: 0,
+        evidence: [],
+      },
+    ],
+    history: [],
+  }
+  const replacement = {
+    id: 'cross-check',
+    title: 'Cross-check',
+    objective: 'Cross-check the accepted inspection evidence.',
+    dependsOn: ['inspect'],
+    scope: [],
+    acceptanceCriteria: [{ id: 'cross-check-ok', text: 'Inspection evidence is cross-checked.' }],
+    covers: [],
+  }
+  const seen = new Set(['inspect', 'old-followup', 'retired'])
+  const input = {
+    baseRevision: 3,
+    action: 'replace_pending',
+    rationale: 'Use the inspection evidence to narrow the follow-up.',
+    tasks: [replacement],
+  }
+  const patch = parseSubtaskPlanPatch(input, spec, plan, currentTasks, seen, { maxPendingTasks: 2 })
+  const completedBefore = structuredClone(plan.steps[0])
+  const applied = applySubtaskPlanPatch(plan, patch, currentTasks, seen)
+
+  assert.equal(applied.applied, true)
+  assert.deepEqual(applied.tasks.map(task => task.id), ['inspect', 'cross-check'])
+  assert.deepEqual(plan.steps[0], completedBefore)
+  assert.deepEqual(plan.steps.map(step => [step.id, step.status, step.dependsOn]), [
+    ['inspect', 'completed', []],
+    ['cross-check', 'pending', ['inspect']],
+  ])
+  assert.equal(plan.patchCount, 1)
+  assert.equal(plan.revision, 4)
+  assert.equal(Object.isFrozen(plan.history[0]), true)
+  assert.deepEqual([...seen], ['inspect', 'old-followup', 'retired', 'cross-check'])
+
+  const original = {
+    ...input,
+    tasks: [{ ...pending, objective: 'Silently change the same pending identity.' }],
+  }
+  assert.throws(
+    () => parseSubtaskPlanPatch(original, spec, {
+      ...plan,
+      revision: 3,
+      patchCount: 0,
+      steps: [plan.steps[0], {
+        ...plan.steps[1], id: pending.id, title: pending.title, objective: pending.objective,
+      }],
+    }, currentTasks, new Set(['inspect', 'old-followup']), { maxPendingTasks: 2 }),
+    /must assign a new id/u,
+  )
+  for (const invalid of [
+    { ...input, baseRevision: 2 },
+    { ...input, tasks: [{ ...replacement, id: 'retired' }] },
+    { ...input, tasks: [{ ...replacement, dependsOn: ['missing'] }] },
+    { ...input, tasks: [{ ...replacement, id: 'cycle', dependsOn: ['cycle'] }] },
+    { ...input, tasks: [replacement], unknown: true },
+  ]) {
+    assert.throws(
+      () => parseSubtaskPlanPatch(invalid, spec, {
+        ...plan,
+        revision: 3,
+        patchCount: 0,
+        steps: [plan.steps[0], {
+          ...plan.steps[1], id: pending.id, title: pending.title, objective: pending.objective,
+        }],
+      }, currentTasks, new Set(['inspect', 'old-followup', 'retired']), { maxPendingTasks: 2 }),
+    )
+  }
+})
+
 test('telemetry projects a session-isolated linear plan, live worker, route, and terminal result', () => {
   let now = 1_000
   const warnings = []
@@ -927,7 +1192,7 @@ test('telemetry projects a session-isolated linear plan, live worker, route, and
   assert.equal(warnings.length, 1)
 
   const live = telemetry.snapshot(spec.parent.id)
-  assert.equal(live.protocolVersion, 1)
+  assert.equal(live.protocolVersion, 2)
   assert.equal(live.sessionId, 'root-1')
   assert.equal(live.tasks.length, 1)
   assert.deepEqual(live.tasks[0].masterPlan.steps.map(step => ({
@@ -1000,11 +1265,11 @@ test('telemetry projects a session-isolated linear plan, live worker, route, and
   })
 })
 
-test('telemetry retains all active tasks and only the newest twenty terminal tasks per session', () => {
+test('telemetry retains all active tasks and only the newest thirty-two terminal tasks per session', () => {
   let now = 0
   const telemetry = createDispatcherTelemetry({}, { now: () => ++now })
   const parent = { id: 'bounded-session' }
-  for (let index = 0; index < 22; index++) {
+  for (let index = 0; index < 34; index++) {
     const taskId = `terminal-${index}`
     telemetry.startTask({ taskId, parent, laneId: 'code', title: taskId })
     telemetry.finishTask(taskId, {
@@ -1018,11 +1283,67 @@ test('telemetry retains all active tasks and only the newest twenty terminal tas
   telemetry.startTask({ taskId: 'still-running', parent, laneId: 'code', title: 'still running' })
 
   const tasks = telemetry.snapshot(parent.id).tasks
-  assert.equal(tasks.length, 21)
+  assert.equal(tasks.length, 33)
   assert.equal(tasks[0].taskId, 'still-running')
   assert.equal(tasks.some(task => task.taskId === 'terminal-0'), false)
   assert.equal(tasks.some(task => task.taskId === 'terminal-1'), false)
-  assert.equal(tasks.some(task => task.taskId === 'terminal-21'), true)
+  assert.equal(tasks.some(task => task.taskId === 'terminal-33'), true)
+})
+
+test('telemetry pins terminal orchestration descendants until their root task finishes', () => {
+  let now = 0
+  const telemetry = createDispatcherTelemetry({}, { now: () => ++now })
+  const parent = { id: 'orchestration-retention-session' }
+  telemetry.startTask({ taskId: 'root-task', parent, laneId: 'root', title: 'Root task' })
+  for (let index = 0; index < 25; index++) {
+    const taskId = `child-${index}`
+    telemetry.startTask({
+      taskId,
+      parent,
+      parentTaskId: 'root-task',
+      orchestrationNodeId: `node-${index}`,
+      orchestrationDepth: 1,
+      laneId: 'leaf',
+      title: taskId,
+    })
+    telemetry.finishTask(taskId, {
+      status: 'accepted',
+      message: 'done',
+      modelVerified: true,
+      workspaceQuarantined: false,
+      failureClass: 'none',
+    })
+  }
+
+  const activeTree = telemetry.snapshot(parent.id).tasks
+  assert.equal(activeTree.length, 26)
+  assert.equal(activeTree.filter(task => task.orchestration !== undefined).length, 25)
+
+  for (let index = 0; index < 10; index++) {
+    const taskId = `unrelated-${index}`
+    telemetry.startTask({ taskId, parent, laneId: 'leaf', title: taskId })
+    telemetry.finishTask(taskId, {
+      status: 'accepted',
+      message: 'unrelated done',
+      modelVerified: true,
+      workspaceQuarantined: false,
+      failureClass: 'none',
+    })
+  }
+
+  telemetry.finishTask('root-task', {
+    status: 'accepted',
+    message: 'root done',
+    modelVerified: true,
+    workspaceQuarantined: false,
+    failureClass: 'none',
+  })
+  const terminalTree = telemetry.snapshot(parent.id).tasks
+  assert.equal(terminalTree.length, 32)
+  assert.ok(terminalTree.some(task => task.taskId === 'root-task'))
+  for (let index = 0; index < 25; index++) {
+    assert.ok(terminalTree.some(task => task.taskId === `child-${index}`))
+  }
 })
 
 test('telemetry globally retains only the newest two hundred terminal tasks across sessions', () => {
@@ -1471,7 +1792,7 @@ test('telemetry watch is lossless across subscription, timeout, and cancellation
     snapshot: sessionId => {
       reentrantAbort.abort(new Error('aborted during snapshot'))
       return {
-        protocolVersion: 1,
+        protocolVersion: 2,
         revision: 1,
         sessionId,
         generatedAt: 0,
@@ -1490,7 +1811,7 @@ test('telemetry watch is lossless across subscription, timeout, and cancellation
   let raceSubscribed = false
   const raced = await watchDispatcherTelemetry({
     snapshot: sessionId => ({
-      protocolVersion: 1,
+      protocolVersion: 2,
       revision: raceRevision,
       sessionId,
       generatedAt: 0,
@@ -1515,7 +1836,7 @@ test('telemetry watch is lossless across subscription, timeout, and cancellation
   let eagerDisposeCount = 0
   const eager = await watchDispatcherTelemetry({
     snapshot: sessionId => ({
-      protocolVersion: 1,
+      protocolVersion: 2,
       revision: eagerRevision,
       sessionId,
       generatedAt: 0,
@@ -1538,7 +1859,7 @@ test('telemetry watch is lossless across subscription, timeout, and cancellation
   let brokenReservations = 0
   await assert.rejects(watchDispatcherTelemetry({
     snapshot: sessionId => ({
-      protocolVersion: 1,
+      protocolVersion: 2,
       revision: 0,
       sessionId,
       generatedAt: 0,
@@ -1671,7 +1992,7 @@ test('telemetry RPC has strict payloads, contained RpcResult errors, and optiona
   const handler = createDispatcherTelemetryRpcHandler(telemetry)
   const snapshot = await handler('snapshot', { sessionId: 'root-1' }, new AbortController().signal)
   assert.equal(snapshot.ok, true)
-  assert.equal(snapshot.value.protocolVersion, 1)
+  assert.equal(snapshot.value.protocolVersion, 2)
 
   const invalid = await handler('snapshot', { sessionId: '' }, new AbortController().signal)
   assert.deepEqual(invalid, {
@@ -2158,7 +2479,7 @@ test('adaptive master plan runs two steps with an intervening keep decision and 
   )
   telemetry.finishTask(spec.taskId, result)
 
-  assert.equal(result.status, 'accepted')
+  assert.equal(result.status, 'accepted', result.message)
   assert.equal(result.modelVerified, true)
   assert.equal(result.attempts, 2)
   assert.deepEqual(calls.map(call => call.request.label), [
@@ -4187,4 +4508,1320 @@ test('initial plan-review prompt contains the required reviewer contract phrases
     'Prompt must include the decision=accept contract')
   assert.ok(prompt.includes('Advisory notes must not accompany accept'),
     'Prompt must include the advisory notes rule')
+})
+
+test('planner and executor prompts expose effective capabilities and forbid invented artifacts', () => {
+  const spec = pipelineSpec()
+  spec.workspace = '/workspace/project'
+  spec.lane.executorTools = ['read', 'write', 'bash']
+  spec.lane.plannerTools = ['read', 'glob']
+  spec.lane.verifierTools = ['read', 'grep']
+
+  const proposal = {
+    summary: 'Implement one bounded change.',
+    steps: [planStep('implement', { covers: ['requirements'] })],
+  }
+  const plan = createMasterPlan(spec, proposal)
+  const plannerPrompt = buildPlannerPrompt(spec)
+  const reviewPrompt = buildPlanReviewPrompt(spec, plan, 'initial')
+  const executorPrompt = buildExecutorPrompt(spec, 1)
+  const stepPrompt = buildPlanStepExecutorPrompt(spec, plan, plan.steps[0], 1)
+
+  for (const prompt of [plannerPrompt, reviewPrompt, executorPrompt, stepPrompt]) {
+    assert.match(prompt, /deployment_capabilities_json/u)
+    assert.match(prompt, /"planShape": "linear"/u)
+    assert.match(prompt, /"workspace": "\/workspace\/project"/u)
+    assert.match(prompt, /"workspaceMutationAllowed": true/u)
+    assert.match(prompt, /"write"/u)
+  }
+  assert.match(plannerPrompt, /Never assume an unavailable tool/u)
+  assert.match(reviewPrompt, /decision=blocked when the immutable task cannot be completed/u)
+  assert.match(executorPrompt, /Never report an artifact as created or modified unless/u)
+  assert.match(stepPrompt, /Never report an artifact as created or modified unless/u)
+})
+
+test('Host orchestration executes a reviewed read-only DAG in parallel without exposing raw recursion', async () => {
+  const childLane = lane({
+    executorTools: ['read', 'grep'],
+    plannerTools: [],
+    verifierTools: ['read'],
+    planner: undefined,
+    maxAttempts: 1,
+    retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read', 'grep'],
+        plannerTools: ['read'],
+        verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 2,
+          maxTaskNodes: 8,
+          maxChildrenPerNode: 4,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 12,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    deliverables: [{ id: 'code', description: 'A bounded inspected artifact.' }],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+
+  const proposal = {
+    summary: 'Inspect the artifact and independently check the requirements.',
+    tasks: [
+      {
+        id: 'inspect',
+        title: 'Inspect reference',
+        objective: 'Read the bounded reference and report concrete evidence.',
+        dependsOn: [],
+        scope: ['code'],
+        acceptanceCriteria: [{ id: 'inspect-ok', text: 'The reference is inspected with evidence.' }],
+        covers: ['requirements'],
+      },
+      {
+        id: 'cross-check',
+        title: 'Cross-check facts',
+        objective: 'Independently cross-check the bounded requirements.',
+        dependsOn: [],
+        scope: [],
+        acceptanceCriteria: [{ id: 'cross-check-ok', text: 'The requirements are cross-checked.' }],
+        covers: ['requirements'],
+      },
+    ],
+  }
+  let executorStarts = 0
+  let activeExecutors = 0
+  let maxActiveExecutors = 0
+  let openGate
+  const gate = new Promise(resolve => { openGate = resolve })
+  let sequence = 0
+  const labels = []
+  const immediate = structured => childRun(`run-${++sequence}`, structured).run
+  const concurrentExecutor = (label) => {
+    const criterionId = label.startsWith('Inspect') ? 'inspect-ok' : 'cross-check-ok'
+    const id = `run-${++sequence}`
+    const result = (async () => {
+      executorStarts += 1
+      activeExecutors += 1
+      maxActiveExecutors = Math.max(maxActiveExecutors, activeExecutors)
+      if (executorStarts === 2) openGate()
+      await gate
+      activeExecutors -= 1
+      return {
+        output: [],
+        structured: executorReport({
+          artifacts: [],
+          criteria: [
+            { id: 'requirements', status: 'pass', evidence: 'Lane requirement checked.' },
+            { id: criterionId, status: 'pass', evidence: `${criterionId} evidence.` },
+          ],
+        }),
+        stopReason: 'completed',
+      }
+    })()
+    return { id, result, dispose() {} }
+  }
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        if (request.label.endsWith('/ orchestration planner')) return immediate(proposal)
+        if (request.label.endsWith('/ orchestration plan review')) return immediate(planReviewReport())
+        if (request.label.endsWith('/ orchestration final verifier')) return immediate(verifierReport())
+        if (request.label.endsWith('/ executor 1')) return concurrentExecutor(request.label)
+        if (request.label.startsWith('Inspect reference')) {
+          return immediate(verifierReport(['requirements', 'inspect-ok']))
+        }
+        if (request.label.startsWith('Cross-check facts')) {
+          return immediate(verifierReport(['requirements', 'cross-check-ok']))
+        }
+        throw new Error(`unexpected child label ${request.label}`)
+      },
+    },
+  }
+
+  const telemetry = createDispatcherTelemetry({})
+  telemetry.startTask(spec)
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger, telemetry)
+  telemetry.finishTask(spec.taskId, result)
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.modelVerified, true)
+  assert.equal(maxActiveExecutors, 2)
+  assert.deepEqual(result.masterPlan.steps.map(step => [step.id, step.status, step.dependsOn]), [
+    ['inspect', 'completed', []],
+    ['cross-check', 'completed', []],
+  ])
+  assert.equal(labels.some(label => /dispatch_task|workflow|ralph/u.test(label)), false)
+  assert.equal(SUBTASK_PLAN_OUTPUT_SCHEMA.additionalProperties, false)
+  assert.equal(SUBTASK_PLAN_OUTPUT_SCHEMA.properties.tasks.items.additionalProperties, false)
+  assert.match(buildSubtaskPlannerPrompt(spec), /rawRecursiveToolsAvailable": false/u)
+  const recursiveTasks = telemetry.snapshot(spec.parent.id).tasks
+    .filter(task => task.orchestration !== undefined)
+  assert.equal(recursiveTasks.length, 2)
+  assert.deepEqual(recursiveTasks.map(task => task.orchestration.nodeId).sort(), ['cross-check', 'inspect'])
+  assert.ok(recursiveTasks.every(task => task.orchestration.parentTaskId === spec.taskId))
+  assert.ok(recursiveTasks.every(task => task.orchestration.depth === 1))
+})
+
+test('Host orchestration dynamically replaces only the pending DAG after a settled wave', async () => {
+  const childLane = lane({
+    executorTools: ['read'],
+    plannerTools: [],
+    verifierTools: ['read'],
+    planner: undefined,
+    maxAttempts: 1,
+    retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'],
+        plannerTools: ['read'],
+        verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 2,
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 6,
+          maxChildrenPerNode: 4,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 12,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Adaptive orchestration root',
+    deliverables: [{ id: 'artifact', description: 'A bounded inspected artifact.' }],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+
+  const initial = {
+    summary: 'Probe the artifact, then follow up using the observed evidence.',
+    tasks: [
+      {
+        id: 'probe',
+        title: 'Probe evidence',
+        objective: 'Inspect the artifact and establish concrete evidence.',
+        dependsOn: [],
+        scope: ['artifact'],
+        acceptanceCriteria: [{ id: 'probe-ok', text: 'The probe records concrete evidence.' }],
+        covers: ['requirements'],
+      },
+      {
+        id: 'old-followup',
+        title: 'Old follow-up',
+        objective: 'Use the original follow-up assumption.',
+        dependsOn: ['probe'],
+        scope: ['artifact'],
+        acceptanceCriteria: [{ id: 'old-ok', text: 'The original follow-up is checked.' }],
+        covers: ['requirements'],
+      },
+    ],
+  }
+  const patch = {
+    baseRevision: 3,
+    action: 'replace_pending',
+    rationale: 'Probe evidence makes a narrower cross-check more useful.',
+    tasks: [{
+      id: 'evidence-cross-check',
+      title: 'Evidence cross-check',
+      objective: 'Cross-check the concrete probe evidence without changing the artifact.',
+      dependsOn: ['probe'],
+      scope: ['artifact'],
+      acceptanceCriteria: [{ id: 'cross-check-ok', text: 'Probe evidence is independently cross-checked.' }],
+      covers: ['requirements'],
+    }],
+  }
+  const labels = []
+  let sequence = 0
+  const immediate = structured => childRun(`dynamic-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        switch (request.label) {
+          case 'Adaptive orchestration root / orchestration planner': return immediate(initial)
+          case 'Adaptive orchestration root / orchestration plan review': return immediate(planReviewReport())
+          case 'Adaptive orchestration root / orchestration replanner 2': return immediate(patch)
+          case 'Adaptive orchestration root / orchestration patch review 2': return immediate(planReviewReport())
+          case 'Adaptive orchestration root / orchestration final verifier': return immediate(verifierReport())
+          case 'Probe evidence / executor 1':
+            return immediate(executorReport({
+              artifacts: [],
+              criteria: [
+                { id: 'requirements', status: 'pass', evidence: 'Root requirement inspected.' },
+                { id: 'probe-ok', status: 'pass', evidence: 'Probe evidence recorded.' },
+              ],
+            }))
+          case 'Probe evidence / verifier 1':
+            return immediate(verifierReport(['requirements', 'probe-ok']))
+          case 'Evidence cross-check / executor 1':
+            return immediate(executorReport({
+              artifacts: [],
+              criteria: [
+                { id: 'requirements', status: 'pass', evidence: 'Root requirement cross-checked.' },
+                { id: 'cross-check-ok', status: 'pass', evidence: 'Probe evidence independently checked.' },
+              ],
+            }))
+          case 'Evidence cross-check / verifier 1':
+            return immediate(verifierReport(['requirements', 'cross-check-ok']))
+          default: throw new Error(`unexpected child label ${request.label}`)
+        }
+      },
+    },
+  }
+
+  const telemetry = createDispatcherTelemetry({})
+  telemetry.startTask(spec)
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger, telemetry)
+  telemetry.finishTask(spec.taskId, result)
+
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.masterPlan.patchCount, 1)
+  assert.deepEqual(result.masterPlan.steps.map(step => [step.id, step.status, step.dependsOn]), [
+    ['probe', 'completed', []],
+    ['evidence-cross-check', 'completed', ['probe']],
+  ])
+  assert.deepEqual(result.masterPlan.history.find(event => event.kind === 'revised'), {
+    revision: 4,
+    kind: 'revised',
+    rationale: patch.rationale,
+    added: ['evidence-cross-check'],
+    removed: ['old-followup'],
+    order: ['evidence-cross-check'],
+  })
+  assert.equal(labels.some(label => label.startsWith('Old follow-up /')), false)
+  assert.ok(labels.indexOf('Probe evidence / verifier 1')
+    < labels.indexOf('Adaptive orchestration root / orchestration replanner 2'))
+  const root = telemetry.snapshot(spec.parent.id).tasks.find(task => task.taskId === spec.taskId)
+  assert.equal(root.masterPlan.revision, result.masterPlan.revision)
+  assert.deepEqual(root.masterPlan.steps.map(step => [step.id, step.dependsOn]), [
+    ['probe', []],
+    ['evidence-cross-check', ['probe']],
+  ])
+  assert.equal(SUBTASK_PLAN_PATCH_OUTPUT_SCHEMA.additionalProperties, false)
+})
+
+test('orchestration replans only after every parallel child in the wave has cleaned up', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 2,
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 6,
+          maxChildrenPerNode: 4,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 14,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({ lane: configured.lanes.root, laneId: 'root', title: 'Wave barrier root', deliverables: [] })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Inspect two sources before combining them.',
+    tasks: [
+      {
+        id: 'source-a', title: 'Source A', objective: 'Inspect source A.', dependsOn: [], scope: [],
+        acceptanceCriteria: [{ id: 'source-a-ok', text: 'Source A is inspected.' }], covers: ['requirements'],
+      },
+      {
+        id: 'source-b', title: 'Source B', objective: 'Inspect source B.', dependsOn: [], scope: [],
+        acceptanceCriteria: [{ id: 'source-b-ok', text: 'Source B is inspected.' }], covers: ['requirements'],
+      },
+      {
+        id: 'combine', title: 'Combine evidence', objective: 'Combine both sources.',
+        dependsOn: ['source-a', 'source-b'], scope: [],
+        acceptanceCriteria: [{ id: 'combine-ok', text: 'Both sources are combined.' }], covers: ['requirements'],
+      },
+    ],
+  }
+  const keep = {
+    baseRevision: 5,
+    action: 'keep',
+    rationale: 'Both source results support the existing combine node.',
+    tasks: [],
+  }
+  const labels = []
+  const events = []
+  let sequence = 0
+  let releaseDispose
+  let notifyDispose
+  const disposeStarted = new Promise(resolve => { notifyDispose = resolve })
+  const disposeGate = new Promise(resolve => { releaseDispose = resolve })
+  const immediate = structured => childRun(`barrier-${++sequence}`, structured).run
+  const delayedVerifier = () => ({
+    id: `barrier-${++sequence}`,
+    result: Promise.resolve({
+      output: [],
+      structured: verifierReport(['requirements', 'source-b-ok']),
+      stopReason: 'completed',
+    }),
+    async dispose() {
+      events.push('source-b-cleanup-started')
+      notifyDispose()
+      await disposeGate
+      events.push('source-b-cleanup-finished')
+    },
+  })
+  const childCriteria = label => label.startsWith('Source A')
+    ? ['requirements', 'source-a-ok']
+    : label.startsWith('Source B')
+      ? ['requirements', 'source-b-ok']
+      : ['requirements', 'combine-ok']
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        events.push(request.label)
+        if (request.label === 'Wave barrier root / orchestration planner') return immediate(proposal)
+        if (request.label === 'Wave barrier root / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Wave barrier root / orchestration replanner 2') return immediate(keep)
+        if (request.label === 'Wave barrier root / orchestration final verifier') return immediate(verifierReport())
+        if (request.label === 'Source B / verifier 1') return delayedVerifier()
+        if (request.label.endsWith('/ executor 1')) {
+          return immediate(executorReport({
+            artifacts: [],
+            criteria: childCriteria(request.label).map(id => ({ id, status: 'pass', evidence: `${id} evidence.` })),
+          }))
+        }
+        if (request.label.endsWith('/ verifier 1')) return immediate(verifierReport(childCriteria(request.label)))
+        throw new Error(`unexpected child label ${request.label}`)
+      },
+    },
+  }
+
+  const running = runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  await disposeStarted
+  assert.equal(labels.includes('Wave barrier root / orchestration replanner 2'), false)
+  releaseDispose()
+  const result = await running
+
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.masterPlan.patchCount, 0)
+  assert.ok(events.indexOf('source-b-cleanup-finished')
+    < events.indexOf('Wave barrier root / orchestration replanner 2'))
+  assert.ok(labels.indexOf('Wave barrier root / orchestration replanner 2')
+    < labels.indexOf('Combine evidence / executor 1'))
+  assert.equal(labels.some(label => label.includes('orchestration patch review')), false)
+})
+
+test('collect mode cannot erase an earlier quarantined child through a later successful replan', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 1,
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 5,
+          maxChildrenPerNode: 4,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 13,
+          failureMode: 'collect',
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Collect quarantine root',
+    deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Collect one failed branch while independent verified work continues.',
+    tasks: [
+      {
+        id: 'unsafe', title: 'Unsafe cleanup', objective: 'Inspect work whose cleanup ownership is lost.',
+        dependsOn: [], scope: [],
+        acceptanceCriteria: [{ id: 'unsafe-ok', text: 'Unsafe work is inspected.' }],
+        covers: ['requirements'],
+      },
+      {
+        id: 'source', title: 'Safe source', objective: 'Inspect the independent safe source.',
+        dependsOn: [], scope: [],
+        acceptanceCriteria: [{ id: 'source-ok', text: 'Safe source is inspected.' }],
+        covers: ['requirements'],
+      },
+      {
+        id: 'check', title: 'Safe check', objective: 'Check the safe source evidence.',
+        dependsOn: ['source'], scope: [],
+        acceptanceCriteria: [{ id: 'check-ok', text: 'Safe source evidence is checked.' }],
+        covers: ['requirements'],
+      },
+      {
+        id: 'finish', title: 'Safe finish', objective: 'Finish the independent safe chain.',
+        dependsOn: ['check'], scope: [],
+        acceptanceCriteria: [{ id: 'finish-ok', text: 'Safe chain is complete.' }],
+        covers: ['requirements'],
+      },
+    ],
+  }
+  const labels = []
+  let sequence = 0
+  const immediate = structured => childRun(`collect-quarantine-${++sequence}`, structured).run
+  const idsFor = (label) => {
+    if (label.startsWith('Unsafe cleanup')) return ['requirements', 'unsafe-ok']
+    if (label.startsWith('Safe source')) return ['requirements', 'source-ok']
+    if (label.startsWith('Safe check')) return ['requirements', 'check-ok']
+    return ['requirements', 'finish-ok']
+  }
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        if (request.label === 'Collect quarantine root / orchestration planner') return immediate(proposal)
+        if (request.label === 'Collect quarantine root / orchestration plan review') return immediate(planReviewReport())
+        if (request.label.includes('orchestration replanner')) {
+          throw new Error('a prior terminal failure must fence later replanning')
+        }
+        if (request.label.startsWith('Unsafe cleanup / executor 1')) {
+          return childRun(`collect-quarantine-${++sequence}`, executorReport({
+            artifacts: [],
+            criteria: idsFor(request.label).map(id => ({ id, status: 'pass', evidence: `${id} evidence.` })),
+          }), { disposeError: new Error('cleanup ownership lost') }).run
+        }
+        if (request.label.endsWith('/ executor 1')) {
+          return immediate(executorReport({
+            artifacts: [],
+            criteria: idsFor(request.label).map(id => ({ id, status: 'pass', evidence: `${id} evidence.` })),
+          }))
+        }
+        if (request.label.endsWith('/ verifier 1')) return immediate(verifierReport(idsFor(request.label)))
+        throw new Error(`unexpected child label ${request.label}`)
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+
+  assert.equal(result.status, 'error')
+  assert.equal(result.workspaceQuarantined, true)
+  assert.equal(result.failureClass, 'infrastructure')
+  assert.equal(result.modelVerified, false)
+  assert.equal(labels.some(label => label.includes('orchestration replanner')), false)
+  assert.equal(labels.includes('Safe finish / verifier 1'), true)
+  assert.equal(labels.some(label => label.includes('orchestration final verifier')), false)
+  assert.equal(result.masterPlan.patchCount, 0)
+  assert.deepEqual(result.masterPlan.steps.map(step => [step.id, step.status]), [
+    ['unsafe', 'pending'],
+    ['source', 'completed'],
+    ['check', 'completed'],
+    ['finish', 'completed'],
+  ])
+})
+
+test('orchestration preserves the mandatory DAG when no optional replan credits remain', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 4,
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 7,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({ lane: configured.lanes.root, laneId: 'root', title: 'Exact budget root', deliverables: [] })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Run the exact two-node mandatory chain.',
+    tasks: ['first', 'second'].map((id, index) => ({
+      id,
+      title: index === 0 ? 'First node' : 'Second node',
+      objective: `Inspect the ${id} bounded fact.`,
+      dependsOn: index === 0 ? [] : ['first'],
+      scope: [],
+      acceptanceCriteria: [{ id: `${id}-ok`, text: `${id} has evidence.` }],
+      covers: ['requirements'],
+    })),
+  }
+  const labels = []
+  let sequence = 0
+  const immediate = structured => childRun(`exact-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        if (request.label === 'Exact budget root / orchestration planner') return immediate(proposal)
+        if (request.label === 'Exact budget root / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Exact budget root / orchestration final verifier') return immediate(verifierReport())
+        const criterionId = request.label.startsWith('First node') ? 'first-ok' : 'second-ok'
+        if (request.label.endsWith('/ executor 1')) {
+          return immediate(executorReport({
+            artifacts: [],
+            criteria: [
+              { id: 'requirements', status: 'pass', evidence: 'Root requirement checked.' },
+              { id: criterionId, status: 'pass', evidence: `${criterionId} evidence.` },
+            ],
+          }))
+        }
+        if (request.label.endsWith('/ verifier 1')) return immediate(verifierReport(['requirements', criterionId]))
+        throw new Error(`unexpected child label ${request.label}`)
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.masterPlan.patchCount, 0)
+  assert.equal(labels.some(label => label.includes('orchestration replanner')), false)
+  assert.deepEqual(result.masterPlan.steps.map(step => step.id), ['first', 'second'])
+})
+
+test('a suspended nested orchestrator safely resumes to patch its own pending plan', async () => {
+  const readOnlyLane = overrides => lane({
+    executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+    maxAttempts: 1, retryOnRevise: false, ...overrides,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      leaf: readOnlyLane({ planner: undefined, plannerTools: [] }),
+      branch: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 1,
+        orchestration: {
+          enabled: true,
+          childLane: 'leaf',
+          maxDepth: 1,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 9,
+        },
+      }),
+      root: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'branch',
+          maxDepth: 2,
+          maxTaskNodes: 4,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 12,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({ lane: configured.lanes.root, laneId: 'root', title: 'Nested dynamic root', deliverables: [] })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const rootProposal = {
+    summary: 'Join one recursively planned branch.',
+    tasks: [{
+      id: 'branch', title: 'Branch node', objective: 'Run and verify the adaptive branch.',
+      dependsOn: [], scope: [],
+      acceptanceCriteria: [{ id: 'branch-ok', text: 'The adaptive branch is verified.' }],
+      covers: ['requirements'],
+    }],
+  }
+  const branchProposal = {
+    summary: 'Inspect once, then adapt the remaining check.',
+    tasks: [
+      {
+        id: 'inspect', title: 'Nested inspect', objective: 'Inspect the bounded evidence.',
+        dependsOn: [], scope: [],
+        acceptanceCriteria: [{ id: 'inspect-ok', text: 'Nested evidence is inspected.' }],
+        covers: ['requirements', 'branch-ok'],
+      },
+      {
+        id: 'old-check', title: 'Old nested check', objective: 'Use the original nested check.',
+        dependsOn: ['inspect'], scope: [],
+        acceptanceCriteria: [{ id: 'old-check-ok', text: 'Original nested check is complete.' }],
+        covers: ['requirements', 'branch-ok'],
+      },
+    ],
+  }
+  const patch = {
+    baseRevision: 3,
+    action: 'replace_pending',
+    rationale: 'Use a fresh check derived from the inspection evidence.',
+    tasks: [{
+      id: 'fresh-check', title: 'Fresh nested check', objective: 'Cross-check the inspected evidence.',
+      dependsOn: ['inspect'], scope: [],
+      acceptanceCriteria: [{ id: 'fresh-check-ok', text: 'Inspected evidence is cross-checked.' }],
+      covers: ['requirements', 'branch-ok'],
+    }],
+  }
+  const labels = []
+  let sequence = 0
+  const immediate = structured => childRun(`nested-dynamic-${++sequence}`, structured).run
+  const ctx = {
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        switch (request.label) {
+          case 'Nested dynamic root / orchestration planner': return immediate(rootProposal)
+          case 'Nested dynamic root / orchestration plan review': return immediate(planReviewReport())
+          case 'Branch node / orchestration planner': return immediate(branchProposal)
+          case 'Branch node / orchestration plan review': return immediate(planReviewReport())
+          case 'Branch node / orchestration replanner 2': return immediate(patch)
+          case 'Branch node / orchestration patch review 2': return immediate(planReviewReport())
+          case 'Branch node / orchestration final verifier': return immediate(verifierReport(['requirements', 'branch-ok']))
+          case 'Nested dynamic root / orchestration final verifier': return immediate(verifierReport())
+          default: {
+            const match = /^(Nested inspect|Fresh nested check) \/ (executor|verifier) 1$/u.exec(request.label)
+            if (match === null) throw new Error(`unexpected child label ${request.label}`)
+            const localId = match[1] === 'Nested inspect' ? 'inspect-ok' : 'fresh-check-ok'
+            const ids = ['requirements', 'branch-ok', localId]
+            return match[2] === 'executor'
+              ? immediate(executorReport({
+                  artifacts: [],
+                  criteria: ids.map(id => ({ id, status: 'pass', evidence: `${id} evidence.` })),
+                }))
+              : immediate(verifierReport(ids))
+          }
+        }
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  assert.equal(result.status, 'accepted')
+  assert.equal(labels.some(label => label.startsWith('Old nested check /')), false)
+  const branchResult = result.executorRuns[0].report
+  assert.equal(branchResult.status, 'accepted')
+  assert.ok(labels.indexOf('Branch node / orchestration replanner 2')
+    < labels.indexOf('Fresh nested check / executor 1'))
+})
+
+test('Host orchestration recursively joins depth-two work with one shared slot and locally reusable node ids', async () => {
+  const readOnlyLane = overrides => lane({
+    executorTools: ['read'],
+    plannerTools: ['read'],
+    verifierTools: ['read'],
+    maxAttempts: 1,
+    retryOnRevise: false,
+    ...overrides,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      leaf: readOnlyLane({ planner: undefined, plannerTools: [] }),
+      branch: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'leaf',
+          maxDepth: 2,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 9,
+        },
+      }),
+      root: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'branch',
+          maxDepth: 2,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 1,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 12,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Root orchestration',
+    deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+
+  const rootProposal = {
+    summary: 'Delegate one bounded branch.',
+    tasks: [{
+      id: 'inspect',
+      title: 'Nested branch',
+      objective: 'Delegate and join one bounded leaf inspection.',
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: 'branch-ok', text: 'The nested branch is independently verified.' }],
+      covers: ['requirements'],
+    }],
+  }
+  const branchProposal = {
+    summary: 'Run one leaf inspection.',
+    tasks: [{
+      id: 'inspect',
+      title: 'Leaf inspection',
+      objective: 'Inspect the bounded requirement and return evidence.',
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: 'leaf-ok', text: 'The bounded leaf inspection has evidence.' }],
+      covers: ['requirements', 'branch-ok'],
+    }],
+  }
+  let sequence = 0
+  let branchPlannerPrompt = ''
+  const immediate = structured => childRun(`nested-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        switch (request.label) {
+          case 'Root orchestration / orchestration planner': return immediate(rootProposal)
+          case 'Root orchestration / orchestration plan review': return immediate(planReviewReport())
+          case 'Nested branch / orchestration planner': {
+            branchPlannerPrompt = request.prompt[0].text
+            return immediate(branchProposal)
+          }
+          case 'Nested branch / orchestration plan review': return immediate(planReviewReport())
+          case 'Leaf inspection / executor 1': return immediate(executorReport({
+            artifacts: [],
+            criteria: [
+              { id: 'requirements', status: 'pass', evidence: 'Requirement inspected.' },
+              { id: 'branch-ok', status: 'pass', evidence: 'Branch criterion covered by the leaf.' },
+              { id: 'leaf-ok', status: 'pass', evidence: 'Leaf evidence recorded.' },
+            ],
+          }))
+          case 'Leaf inspection / verifier 1': {
+            return immediate(verifierReport(['requirements', 'branch-ok', 'leaf-ok']))
+          }
+          case 'Nested branch / orchestration final verifier': {
+            return immediate(verifierReport(['requirements', 'branch-ok']))
+          }
+          case 'Root orchestration / orchestration final verifier': return immediate(verifierReport())
+          default: throw new Error(`unexpected child label ${request.label}`)
+        }
+      },
+    },
+  }
+  const telemetry = createDispatcherTelemetry({})
+  telemetry.startTask(spec)
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger, telemetry)
+  telemetry.finishTask(spec.taskId, result)
+
+  assert.deepEqual({ status: result.status, message: result.message }, {
+    status: 'accepted',
+    message: 'final verifier accepted the joined subtask DAG and every root criterion',
+  })
+  assert.equal(result.modelVerified, true)
+  const recursiveTasks = telemetry.snapshot(spec.parent.id).tasks
+    .filter(task => task.orchestration !== undefined)
+    .sort((left, right) => left.orchestration.depth - right.orchestration.depth)
+  assert.deepEqual(recursiveTasks.map(task => ({
+    nodeId: task.orchestration.nodeId,
+    depth: task.orchestration.depth,
+  })), [
+    { nodeId: 'inspect', depth: 1 },
+    { nodeId: 'inspect', depth: 2 },
+  ])
+  assert.equal(new Set(recursiveTasks.map(task => task.taskId)).size, 2)
+  assert.equal(recursiveTasks[1].orchestration.parentTaskId, recursiveTasks[0].taskId)
+  assert.match(branchPlannerPrompt, /Use 1-1 immediate child tasks/u)
+  assert.match(branchPlannerPrompt, /"maxChildrenPerNode": 1/u)
+})
+
+function singleLeafOrchestrationFixture(orchestrationOverrides = {}) {
+  const childLane = lane({
+    executorTools: ['read'],
+    plannerTools: [],
+    verifierTools: ['read'],
+    planner: undefined,
+    maxAttempts: 1,
+    retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'],
+        plannerTools: ['read'],
+        verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 2,
+          maxChildrenPerNode: 1,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 8,
+          ...orchestrationOverrides,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Safe root orchestration',
+    deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Run one bounded verified leaf.',
+    tasks: [{
+      id: 'leaf',
+      title: 'Verified leaf',
+      objective: 'Inspect the bounded requirement and return evidence.',
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: 'leaf-ok', text: 'The leaf has concrete evidence.' }],
+      covers: ['requirements'],
+    }],
+  }
+  return { spec, proposal }
+}
+
+function singleLeafContext(proposal, options = {}) {
+  let sequence = 0
+  let plannerCalls = 0
+  const immediate = (structured, runOptions) => childRun(`safe-${++sequence}`, structured, runOptions).run
+  return {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        if (request.label.endsWith('/ orchestration planner')) {
+          plannerCalls += 1
+          if (plannerCalls === 1 && options.firstPlannerProtocolMiss === true) {
+            return immediate(undefined, {
+              stopReason: 'error',
+              output: [{ type: 'text', text: '# Untrusted plain-text plan' }],
+            })
+          }
+          return immediate(proposal)
+        }
+        if (request.label.endsWith('/ orchestration planner protocol retry')) return immediate(proposal)
+        if (request.label.endsWith('/ orchestration plan review')) return immediate(planReviewReport())
+        if (request.label.endsWith('/ executor 1')) {
+          return options.executorRun?.() ?? immediate(executorReport({
+            artifacts: [],
+            criteria: [
+              { id: 'requirements', status: 'pass', evidence: 'Requirement inspected.' },
+              { id: 'leaf-ok', status: 'pass', evidence: 'Leaf evidence recorded.' },
+            ],
+          }))
+        }
+        if (request.label.endsWith('/ verifier 1')) {
+          return immediate(verifierReport(['requirements', 'leaf-ok']))
+        }
+        if (request.label.endsWith('/ orchestration final verifier')) {
+          return options.finalRun?.() ?? immediate(verifierReport())
+        }
+        throw new Error(`unexpected child label ${request.label}`)
+      },
+    },
+  }
+}
+
+test('orchestration planner retries one structured protocol miss within the shared model budget', async () => {
+  const { spec, proposal } = singleLeafOrchestrationFixture({ maxTotalModelRuns: 6 })
+  const ctx = singleLeafContext(proposal, { firstPlannerProtocolMiss: true })
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+
+  assert.equal(result.status, 'accepted')
+  assert.deepEqual(result.plannerRuns.map(run => [run.attempt, run.status]), [
+    [1, 'error'],
+    [2, 'completed'],
+  ])
+  assert.equal(result.planReviewRuns.length, 1)
+  assert.equal(result.executorRuns.length, 1)
+  assert.equal(result.verifierRuns.length, 1)
+})
+
+test('root orchestration settlement failure overrides nominal acceptance and quarantines the task', async () => {
+  const { spec, proposal } = singleLeafOrchestrationFixture()
+  const ctx = singleLeafContext(proposal)
+  class RootSettlementFaultLedger extends OrchestrationGrantLedger {
+    settle(token, authority) {
+      if (this.snapshot(token, authority).depth === 0) throw new Error('injected root settlement fault')
+      return super.settle(token, authority)
+    }
+  }
+  const result = await runTaskPipeline(
+    ctx,
+    spec,
+    undefined,
+    ctx.logger,
+    undefined,
+    { createOrchestrationLedger: policy => new RootSettlementFaultLedger(policy) },
+  )
+
+  assert.equal(result.status, 'error')
+  assert.equal(result.modelVerified, false)
+  assert.equal(result.workspaceQuarantined, true)
+  assert.equal(result.failureClass, 'infrastructure')
+  assert.match(result.message, /authority did not close cleanly.*injected root settlement fault/u)
+})
+
+test('orchestration cannot publish acceptance after the root is cancelled during final verification', async () => {
+  const { spec, proposal } = singleLeafOrchestrationFixture()
+  const controller = new AbortController()
+  const ctx = singleLeafContext(proposal, {
+    finalRun() {
+      return childRun('cancel-final', undefined, {
+        result: Promise.resolve().then(() => {
+          controller.abort(new Error('cancel at final publication'))
+          return { output: [], structured: verifierReport(), stopReason: 'completed' }
+        }),
+      }).run
+    },
+  })
+  const result = await runTaskPipeline(ctx, spec, controller.signal, ctx.logger)
+
+  assert.equal(result.status, 'cancelled')
+  assert.equal(result.modelVerified, false)
+  assert.equal(result.failureClass, 'none')
+})
+
+test('orchestration result size fallback preserves quarantine and synchronizes telemetry plan status', async () => {
+  const { spec, proposal } = singleLeafOrchestrationFixture({ maxResultBytes: 4_096 })
+  proposal.summary = 'S'.repeat(2_000)
+  proposal.tasks[0].title = 'T'.repeat(200)
+  proposal.tasks[0].objective = 'O'.repeat(4_000)
+  proposal.tasks[0].acceptanceCriteria[0].text = 'C'.repeat(2_000)
+  const telemetry = createDispatcherTelemetry({})
+  telemetry.startTask(spec)
+  const acceptedContext = singleLeafContext(proposal)
+  const compacted = await runTaskPipeline(acceptedContext, spec, undefined, acceptedContext.logger, telemetry)
+  telemetry.finishTask(spec.taskId, compacted)
+
+  assert.equal(compacted.status, 'error')
+  assert.equal(compacted.modelVerified, false)
+  assert.equal(compacted.masterPlan, undefined)
+  assert.ok(Buffer.byteLength(JSON.stringify(compacted), 'utf8') <= 4_096)
+  const root = telemetry.snapshot(spec.parent.id).tasks.find(task => task.taskId === spec.taskId)
+  assert.equal(root.masterPlan.status, 'error')
+  assert.equal(root.result.status, 'error')
+
+  const quarantinedContext = singleLeafContext(proposal, {
+    executorRun() {
+      return childRun('quarantine-leaf', executorReport({
+        artifacts: [],
+        criteria: [
+          { id: 'requirements', status: 'pass', evidence: 'Requirement inspected.' },
+          { id: 'leaf-ok', status: 'pass', evidence: 'Leaf evidence recorded.' },
+        ],
+      }), { disposeError: new Error('cleanup ownership lost') }).run
+    },
+  })
+  const quarantined = await runTaskPipeline(quarantinedContext, spec, undefined, quarantinedContext.logger)
+  assert.equal(quarantined.status, 'error')
+  assert.equal(quarantined.workspaceQuarantined, true)
+  assert.equal(quarantined.failureClass, 'infrastructure')
+  assert.ok(Buffer.byteLength(JSON.stringify(quarantined), 'utf8') <= 4_096)
+})
+
+test('two recursive parents share FIFO admission without false concurrency failures', async () => {
+  const readOnlyLane = overrides => lane({
+    executorTools: ['read'],
+    plannerTools: ['read'],
+    verifierTools: ['read'],
+    maxAttempts: 1,
+    retryOnRevise: false,
+    ...overrides,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      leaf: readOnlyLane({ planner: undefined, plannerTools: [] }),
+      branch: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'leaf',
+          maxDepth: 1,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 7,
+        },
+      }),
+      root: readOnlyLane({
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'branch',
+          maxDepth: 2,
+          maxTaskNodes: 7,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 17,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Shared admission root',
+    deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+
+  const rootProposal = {
+    summary: 'Run two independently joined recursive branches.',
+    tasks: ['a', 'b'].map(id => ({
+      id: `branch-${id}`,
+      title: `Branch ${id.toUpperCase()}`,
+      objective: `Join the bounded ${id.toUpperCase()} branch.`,
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: `branch-${id}-ok`, text: `Branch ${id.toUpperCase()} is verified.` }],
+      covers: ['requirements'],
+    })),
+  }
+  const branchProposal = id => ({
+    summary: `Run the two ${id.toUpperCase()} leaves.`,
+    tasks: ['one', 'two'].map(suffix => ({
+      id: `${id}-${suffix}`,
+      title: `${id.toUpperCase()} leaf ${suffix}`,
+      objective: `Inspect the bounded ${id.toUpperCase()} ${suffix} evidence.`,
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: `${id}-${suffix}-ok`, text: `${id.toUpperCase()} ${suffix} has evidence.` }],
+      covers: ['requirements', `branch-${id}-ok`],
+    })),
+  })
+
+  let sequence = 0
+  let activeLeafExecutors = 0
+  let maxActiveLeafExecutors = 0
+  const startedLeaves = []
+  let batch = []
+  let batchTimer
+  const releaseBatch = () => {
+    clearTimeout(batchTimer)
+    batchTimer = undefined
+    const releasing = batch
+    batch = []
+    for (const release of releasing) release()
+  }
+  const immediate = structured => childRun(`parallel-${++sequence}`, structured).run
+  const leafRun = (label, ids) => {
+    const id = `parallel-${++sequence}`
+    const result = new Promise(resolve => {
+      activeLeafExecutors += 1
+      maxActiveLeafExecutors = Math.max(maxActiveLeafExecutors, activeLeafExecutors)
+      startedLeaves.push(label)
+      batch.push(() => {
+        activeLeafExecutors -= 1
+        resolve({
+          output: [],
+          structured: executorReport({
+            artifacts: [],
+            criteria: ids.map(criterionId => ({
+              id: criterionId,
+              status: 'pass',
+              evidence: `Evidence for ${criterionId}.`,
+            })),
+          }),
+          stopReason: 'completed',
+        })
+      })
+      if (batch.length === 2) queueMicrotask(releaseBatch)
+      else batchTimer ??= setTimeout(releaseBatch, 20)
+    })
+    return { id, result, dispose() {} }
+  }
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        switch (request.label) {
+          case 'Shared admission root / orchestration planner': return immediate(rootProposal)
+          case 'Shared admission root / orchestration plan review': return immediate(planReviewReport())
+          case 'Branch A / orchestration planner': return immediate(branchProposal('a'))
+          case 'Branch B / orchestration planner': return immediate(branchProposal('b'))
+          case 'Branch A / orchestration plan review':
+          case 'Branch B / orchestration plan review': return immediate(planReviewReport())
+          case 'Branch A / orchestration final verifier': return immediate(verifierReport(['requirements', 'branch-a-ok']))
+          case 'Branch B / orchestration final verifier': return immediate(verifierReport(['requirements', 'branch-b-ok']))
+          case 'Shared admission root / orchestration final verifier': return immediate(verifierReport())
+          default: {
+            const match = /^(A|B) leaf (one|two) \/ (executor|verifier) 1$/u.exec(request.label)
+            if (match === null) throw new Error(`unexpected child label ${request.label}`)
+            const branchId = match[1].toLowerCase()
+            const localId = `${branchId}-${match[2]}-ok`
+            const criteria = ['requirements', `branch-${branchId}-ok`, localId]
+            return match[3] === 'executor'
+              ? leafRun(request.label, criteria)
+              : immediate(verifierReport(criteria))
+          }
+        }
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  clearTimeout(batchTimer)
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.failureClass, 'none')
+  assert.equal(startedLeaves.length, 4)
+  assert.equal(maxActiveLeafExecutors, 2)
+  assert.equal(result.executorRuns.length, 2)
+})
+
+test('planned orchestration children see only the step budget their attenuated grant can finish', async () => {
+  const childLane = lane({
+    executorTools: ['read'],
+    plannerTools: ['read'],
+    verifierTools: ['read'],
+    planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+    maxPlanSteps: 6,
+    maxTotalChildRuns: 24,
+    maxAttempts: 2,
+    retryOnRevise: true,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'],
+        plannerTools: ['read'],
+        verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 3,
+          maxChildrenPerNode: 2,
+          maxConcurrentNodes: 2,
+          maxTotalModelRuns: 13,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Budget attenuation root',
+    deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const rootProposal = {
+    summary: 'Run two planned children within exact grants.',
+    tasks: ['a', 'b'].map(id => ({
+      id: `child-${id}`,
+      title: `Budgeted child ${id.toUpperCase()}`,
+      objective: `Complete the bounded ${id.toUpperCase()} inspection.`,
+      dependsOn: [],
+      scope: [],
+      acceptanceCriteria: [{ id: `child-${id}-ok`, text: `Child ${id.toUpperCase()} is verified.` }],
+      covers: ['requirements'],
+    })),
+  }
+  const childPlan = id => ({
+    summary: `Inspect child ${id.toUpperCase()} once.`,
+    steps: [planStep('inspect', {
+      acceptanceCriteria: [{ id: 'inspect-ok', text: 'The bounded inspection has evidence.' }],
+      covers: ['requirements', `child-${id}-ok`],
+      deliverableIds: [],
+    })],
+  })
+  let sequence = 0
+  let childPlannerPrompts = 0
+  const immediate = structured => childRun(`budget-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        if (request.label === 'Budget attenuation root / orchestration planner') return immediate(rootProposal)
+        if (request.label === 'Budget attenuation root / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Budget attenuation root / orchestration final verifier') return immediate(verifierReport())
+        const childMatch = /^Budgeted child (A|B) \/ (.*)$/u.exec(request.label)
+        if (childMatch === null) throw new Error(`unexpected child label ${request.label}`)
+        const id = childMatch[1].toLowerCase()
+        const phase = childMatch[2]
+        if (phase === 'initial planner') {
+          childPlannerPrompts += 1
+          assert.match(request.prompt[0].text, /Use 1-1 steps/u)
+          return immediate(childPlan(id))
+        }
+        if (phase === 'initial plan review') return immediate(planReviewReport())
+        if (phase === 'inspect executor 1') {
+          return immediate(executorReport({
+            artifacts: [],
+            criteria: [{ id: 'inspect-ok', status: 'pass', evidence: 'Inspection passed.' }],
+          }))
+        }
+        if (phase === 'inspect verifier 1') return immediate(verifierReport(['inspect-ok']))
+        if (phase === 'final verifier') return immediate(verifierReport(['requirements', `child-${id}-ok`]))
+        throw new Error(`unexpected child phase ${phase}`)
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  assert.equal(result.status, 'accepted')
+  assert.equal(childPlannerPrompts, 2)
 })

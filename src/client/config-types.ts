@@ -12,6 +12,12 @@ export type DispatcherLaneTransport = typeof LANE_TRANSPORTS[number]
 export const LANE_EXECUTION_MODES = ['local', 'distributed'] as const
 export type DispatcherLaneExecutionMode = typeof LANE_EXECUTION_MODES[number]
 
+export const ORCHESTRATION_WORKSPACE_MODES = ['read-shared', 'isolated-write'] as const
+export type DispatcherOrchestrationWorkspaceMode = typeof ORCHESTRATION_WORKSPACE_MODES[number]
+
+export const ORCHESTRATION_FAILURE_MODES = ['fail-fast', 'collect'] as const
+export type DispatcherOrchestrationFailureMode = typeof ORCHESTRATION_FAILURE_MODES[number]
+
 export interface DispatcherRouteConfig {
   provider: string
   model: string
@@ -29,12 +35,26 @@ export interface DispatcherCriterionConfig {
   text: string
 }
 
+export interface DispatcherLaneOrchestrationConfig {
+  enabled: boolean
+  childLane: string
+  maxDepth: number
+  maxTaskNodes: number
+  maxChildrenPerNode: number
+  maxConcurrentNodes: number
+  maxTotalModelRuns: number
+  maxResultBytes: number
+  workspaceMode: DispatcherOrchestrationWorkspaceMode
+  failureMode: DispatcherOrchestrationFailureMode
+}
+
 export interface DispatcherLaneConfig {
   name: string
   description: string
   kind: DispatcherLaneKind
   transport: DispatcherLaneTransport
   execution: DispatcherLaneExecutionConfig
+  orchestration: DispatcherLaneOrchestrationConfig
   executor: DispatcherRouteConfig
   verifier: DispatcherRouteConfig
   planner?: DispatcherRouteConfig
@@ -117,6 +137,18 @@ export function newDispatcherLane(): DispatcherLaneConfig {
     kind: 'general',
     transport: 'spawn',
     execution: { mode: 'local', pool: 'default', workspaceRef: '' },
+    orchestration: {
+      enabled: false,
+      childLane: '',
+      maxDepth: 2,
+      maxTaskNodes: 16,
+      maxChildrenPerNode: 4,
+      maxConcurrentNodes: 4,
+      maxTotalModelRuns: 48,
+      maxResultBytes: 131_072,
+      workspaceMode: 'read-shared',
+      failureMode: 'fail-fast',
+    },
     executor: { provider: '', model: '', maxTokens: 32_000 },
     verifier: { provider: '', model: '', maxTokens: 12_000 },
     plannerTools: [],
