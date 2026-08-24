@@ -13,7 +13,11 @@ For every `dispatch_task` call, the plugin:
    no `planner` route.
 3. When a `planner` is configured, requires a structured initial plan, sends
    that proposal to a separate plan-review child, and executes only an accepted
-   plan.
+   plan. If the initial read-only planner emits plain text instead of recording
+   the required structured result, the Host may start one fresh protocol retry
+   when enough child-run budget remains for review, one executable step, its
+   verifier, and final verification. Plain text is never parsed or accepted as
+   a plan.
 4. Runs an executor and an independent verifier for exactly one plan step at a
    time. Only the Host can mark that step complete.
 5. After a completed step, while pending work and patch budget remain, lets the

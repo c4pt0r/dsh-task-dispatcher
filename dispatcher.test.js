@@ -1821,6 +1821,23 @@ test('runStructuredChild contains child stop, rejection, disposal, cancellation,
     assert.equal(child.disposals(), 1)
   })
 
+  await t.test('plain text instead of structured output is identified as a protocol failure', async () => {
+    const child = childRun('plain-text', undefined, {
+      stopReason: 'error',
+      output: [{ type: 'text', text: '**Markdown plan**' }],
+    })
+    const result = await runStructuredChild(
+      { subagents: { start: () => child.run } },
+      { ...base, signal: new AbortController().signal },
+    )
+    assert.equal(result.ok, false)
+    assert.equal(result.kind, 'error')
+    assert.equal(result.structuredProtocolFailure, true)
+    assert.match(result.error, /without the required structured result/u)
+    assert.match(result.error, /untrusted plain-text output: \*\*Markdown plan\*\*/u)
+    assert.equal(child.disposals(), 1)
+  })
+
   await t.test('start rejection is observed', async () => {
     const result = await runStructuredChild(
       { subagents: { start: () => { throw new Error('start exploded') } } },
@@ -2801,6 +2818,124 @@ test('invalid or independently rejected plans never start an executor', async (t
     assert.deepEqual(result.executorRuns, [])
     assert.deepEqual(result.verifierRuns, [])
     assert.equal(result.masterPlan.status, 'rejected')
+  })
+})
+
+test('initial planner retries one read-only structured protocol miss and then continues normally', async () => {
+  const spec = plannedPipelineSpec({
+    lane: {
+      maxPlanSteps: 1,
+      maxPlanPatches: 0,
+      maxTotalChildRuns: 6,
+    },
+  })
+  const plan = twoStepPlan({
+    steps: [planStep('calculate', { covers: ['requirements'], deliverableIds: ['code'] })],
+  })
+  const children = [
+    childRun('planner-plain-text', undefined, {
+      stopReason: 'error',
+      output: [{ type: 'text', text: '### Plan\nCalculate the result.' }],
+    }),
+    childRun('planner-retry', plan),
+    childRun('plan-review', planReviewReport()),
+    childRun('calculate-executor', executorReport({
+      criteria: [{ id: 'calculate-ok', status: 'pass', evidence: 'The result was calculated.' }],
+    })),
+    childRun('calculate-verifier', verifierReport(['calculate-ok'])),
+    childRun('final-verifier', verifierReport(['requirements'])),
+  ]
+  const calls = []
+  const result = await runTaskPipeline({
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        calls.push(request)
+        return children[calls.length - 1].run
+      },
+    },
+  }, spec, new AbortController().signal)
+
+  assert.equal(result.status, 'accepted')
+  assert.equal(result.modelVerified, true)
+  assert.deepEqual(calls.map(call => call.label), [
+    `${spec.title} / initial planner`,
+    `${spec.title} / initial planner protocol retry`,
+    `${spec.title} / initial plan review`,
+    `${spec.title} / calculate executor 1`,
+    `${spec.title} / calculate verifier 1`,
+    `${spec.title} / final verifier`,
+  ])
+  assert.match(calls[0].prompt[0].text, /structured_output exactly once/u)
+  assert.match(calls[1].prompt[0].text, /STRUCTURED PROTOCOL RETRY/u)
+  assert.match(calls[1].prompt[0].text, /Do not emit prose, Markdown/u)
+  assert.deepEqual(result.plannerRuns.map(run => [run.attempt, run.status]), [
+    [1, 'error'],
+    [2, 'completed'],
+  ])
+  assert.equal(result.masterPlan.steps[0].id, 'calculate')
+})
+
+test('initial planner protocol recovery is bounded and never retries other stop reasons', async (t) => {
+  await t.test('a second protocol miss fails closed without starting review or execution', async () => {
+    const spec = plannedPipelineSpec()
+    const children = ['first', 'second'].map(id => childRun(id, undefined, {
+      stopReason: 'error',
+      output: [{ type: 'text', text: `Markdown ${id}` }],
+    }))
+    let starts = 0
+    const result = await runTaskPipeline({
+      logger: { warn() {} },
+      subagents: { start: () => children[starts++].run },
+    }, spec, new AbortController().signal)
+
+    assert.equal(starts, 2)
+    assert.equal(result.status, 'error')
+    assert.equal(result.modelVerified, false)
+    assert.match(result.message, /initial planner: child ended without the required structured result/u)
+    assert.deepEqual(result.plannerRuns.map(run => [run.attempt, run.status]), [
+      [1, 'error'],
+      [2, 'error'],
+    ])
+    assert.deepEqual(result.planReviewRuns, [])
+    assert.deepEqual(result.executorRuns, [])
+    assert.deepEqual(result.verifierRuns, [])
+  })
+
+  await t.test('refusal is terminal and does not trigger the protocol retry', async () => {
+    const spec = plannedPipelineSpec()
+    const child = childRun('refused', undefined, {
+      stopReason: 'refusal',
+      output: [{ type: 'text', text: 'Cannot plan this task.' }],
+    })
+    let starts = 0
+    const result = await runTaskPipeline({
+      logger: { warn() {} },
+      subagents: { start: () => { starts += 1; return child.run } },
+    }, spec, new AbortController().signal)
+
+    assert.equal(starts, 1)
+    assert.equal(result.status, 'error')
+    assert.match(result.message, /child model refused/u)
+  })
+
+  await t.test('a tight child budget preserves mandatory work instead of retrying', async () => {
+    const spec = plannedPipelineSpec({
+      lane: { maxPlanSteps: 1, maxPlanPatches: 0, maxTotalChildRuns: 5 },
+    })
+    const child = childRun('plain-text', undefined, {
+      stopReason: 'error',
+      output: [{ type: 'text', text: 'Markdown plan.' }],
+    })
+    let starts = 0
+    const result = await runTaskPipeline({
+      logger: { warn() {} },
+      subagents: { start: () => { starts += 1; return child.run } },
+    }, spec, new AbortController().signal)
+
+    assert.equal(starts, 1)
+    assert.equal(result.status, 'error')
+    assert.equal(result.plannerRuns.length, 1)
   })
 })
 
