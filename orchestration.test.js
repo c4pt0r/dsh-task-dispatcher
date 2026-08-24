@@ -429,11 +429,14 @@ test('admission waiters expire without requiring a caller AbortSignal', async ()
       childReservation('two', { expiresAt: now + 30 }),
     ],
   })
-  ledger.start(reservations[0].reservationToken, { taskId: 'task-expiry' })
+  const first = ledger.start(reservations[0].reservationToken, { taskId: 'task-expiry' })
   await assert.rejects(
     ledger.waitForStart(reservations[1].reservationToken, { taskId: 'task-expiry' }),
     error => error instanceof OrchestrationError && error.code === 'EXPIRED',
   )
+  ledger.refund(reservations[1].reservationToken, { taskId: 'task-expiry' })
+  ledger.settle(first, { taskId: 'task-expiry' })
+  assert.equal(ledger.snapshot(root, { taskId: 'task-expiry' }).activeNodes, 0)
 })
 
 test('authority-fenced suspend and resume let depth-two work progress with one concurrency slot', () => {

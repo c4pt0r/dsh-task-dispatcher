@@ -614,7 +614,6 @@ export class OrchestrationGrantLedger {
               return
             }
             waiter.timer = setTimeout(scheduleExpiry, Math.min(remaining, 2_147_483_647))
-            waiter.timer.unref?.()
           } catch (error) {
             if (retire()) reject(error)
           }
