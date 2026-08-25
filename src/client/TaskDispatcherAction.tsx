@@ -15,7 +15,6 @@ import type {
   DispatcherObservable,
   DispatcherPlanStatus,
   DispatcherPlanStep,
-  DispatcherStepStatus,
   DispatcherTask,
   DispatcherTaskPhase,
   DispatcherTaskStatus,
@@ -41,6 +40,25 @@ export type TaskDispatcherActionProps =
 
 type Translate = TaskDispatcherActionProps['t']
 type PlanScope = 'linear' | 'macro' | 'node-local'
+type PlanProgressState = 'completed' | 'working' | 'ready' | 'waiting' | 'failed'
+
+interface PlanProgressEntry {
+  readonly step: DispatcherPlanStep
+  readonly state: PlanProgressState
+  readonly childTask?: DispatcherTask
+  readonly blockedBy: readonly string[]
+  readonly resolution?: 'direct-failure' | 'joining' | 'unsealed' | 'stopped' | 'blocked'
+  readonly failureTone?: 'error' | 'warning'
+}
+
+interface PlanProgressOverview {
+  readonly entries: readonly PlanProgressEntry[]
+  readonly counts: Readonly<Record<PlanProgressState, number>>
+}
+
+const PLAN_PROGRESS_STATES = [
+  'completed', 'working', 'ready', 'waiting', 'failed',
+] as const satisfies readonly PlanProgressState[]
 
 const TASK_STATUS_KEYS = {
   running: 'task.status.running',
@@ -73,12 +91,6 @@ const PLAN_STATUS_KEYS = {
   cancelled: 'plan.status.cancelled',
   error: 'plan.status.error',
 } as const satisfies Record<DispatcherPlanStatus, TaskDispatcherKey>
-
-const STEP_STATUS_KEYS = {
-  pending: 'step.status.pending',
-  working: 'step.status.working',
-  completed: 'step.status.completed',
-} as const satisfies Record<DispatcherStepStatus, TaskDispatcherKey>
 
 const WORKER_ROLE_KEYS = {
   planner: 'worker.role.planner',
@@ -126,14 +138,6 @@ function planDot(status: DispatcherPlanStatus): StateDotState {
   }
 }
 
-function stepDot(status: DispatcherStepStatus): StateDotState {
-  switch (status) {
-    case 'pending': return 'warning'
-    case 'working': return 'ongoing'
-    case 'completed': return 'done'
-  }
-}
-
 function workerDot(status: DispatcherWorkerStatus): StateDotState {
   switch (status) {
     case 'starting':
@@ -143,6 +147,26 @@ function workerDot(status: DispatcherWorkerStatus): StateDotState {
     case 'completed': return 'done'
     case 'error': return 'error'
   }
+}
+
+function progressDot(entry: PlanProgressEntry): StateDotState {
+  switch (entry.state) {
+    case 'completed': return 'done'
+    case 'working': return 'ongoing'
+    case 'ready':
+    case 'waiting': return 'warning'
+    case 'failed': return entry.failureTone === 'error' ? 'error' : 'warning'
+  }
+}
+
+function progressLabel(entry: PlanProgressEntry, t: Translate): string {
+  if (entry.resolution === 'blocked') {
+    return t('progress.status.blocked', { ids: entry.blockedBy.join(', ') })
+  }
+  if (entry.resolution === 'joining') return t('progress.status.joining')
+  if (entry.resolution === 'unsealed') return t('progress.status.unsealed')
+  if (entry.resolution === 'stopped') return t('progress.status.stopped')
+  return t(`progress.status.${entry.state}`)
 }
 
 function workerIsRunning(worker: DispatcherWorker): boolean {
@@ -171,6 +195,113 @@ function planScope(task: DispatcherTask, childTasks: readonly DispatcherTask[]):
   // unclassified because the current wire cannot distinguish their origin.
   if (task.masterPlan !== undefined && !isStrictlyLinearPlan(task.masterPlan)) return 'macro'
   return 'linear'
+}
+
+function childHasFailed(childTask: DispatcherTask | undefined): boolean {
+  return childTask !== undefined
+    && childTask.status !== 'running'
+    && childTask.status !== 'accepted'
+}
+
+/**
+ * Project the published DAG and child-task evidence into display-only states.
+ * "Ready" means dependency-ready, not admitted to an executor slot.
+ */
+export function derivePlanProgress(
+  plan: DispatcherMasterPlan,
+  childTasks: readonly DispatcherTask[],
+): PlanProgressOverview {
+  const childByNode = new Map(childTasks.flatMap(child => (
+    child.orchestration === undefined ? [] : [[child.orchestration.nodeId, child] as const]
+  )))
+  const initial = new Map<string, Pick<PlanProgressEntry, 'state' | 'resolution' | 'failureTone'>>()
+
+  for (const step of plan.steps) {
+    const childTask = childByNode.get(step.id)
+    if (step.status === 'completed') {
+      initial.set(step.id, { state: 'completed' })
+    } else if (childHasFailed(childTask)) {
+      initial.set(step.id, {
+        state: 'failed',
+        resolution: 'direct-failure',
+        failureTone: childTask?.status === 'rejected' || childTask?.status === 'error'
+          ? 'error'
+          : 'warning',
+      })
+    } else if (plan.status !== 'active') {
+      initial.set(step.id, childTask?.status === 'accepted'
+        ? { state: 'failed', resolution: 'unsealed', failureTone: 'warning' }
+        : { state: 'failed', resolution: 'stopped', failureTone: 'warning' })
+    } else if (childTask?.status === 'accepted') {
+      initial.set(step.id, { state: 'working', resolution: 'joining' })
+    } else if (step.status === 'working' || childTask?.status === 'running') {
+      initial.set(step.id, { state: 'working' })
+    }
+  }
+
+  const stepById = new Map(plan.steps.map(step => [step.id, step]))
+  const resolved = new Map<string, PlanProgressEntry>()
+  const resolving = new Set<string>()
+  const resolve = (step: DispatcherPlanStep): PlanProgressEntry => {
+    const existing = resolved.get(step.id)
+    if (existing !== undefined) return existing
+    const childTask = childByNode.get(step.id)
+    const initialEntry = initial.get(step.id)
+    if (initialEntry !== undefined) {
+      const entry = { step, ...initialEntry, childTask, blockedBy: [] }
+      resolved.set(step.id, entry)
+      return entry
+    }
+
+    // A validated plan is acyclic. Keep malformed snapshots conservative so
+    // the visualization never labels a cycle as dependency-ready.
+    if (resolving.has(step.id)) return { step, state: 'waiting', childTask, blockedBy: [] }
+    resolving.add(step.id)
+    const dependencies = step.dependsOn.map(dependencyId => {
+      const dependency = stepById.get(dependencyId)
+      return dependency === undefined ? undefined : resolve(dependency)
+    })
+    resolving.delete(step.id)
+    const blockedBy = [...new Set(dependencies.flatMap((dependency, index) => {
+      if (dependency?.state !== 'failed') return []
+      return dependency.resolution === 'blocked' && dependency.blockedBy.length > 0
+        ? dependency.blockedBy
+        : [step.dependsOn[index]!]
+    }))].sort()
+
+    const dependenciesComplete = dependencies.length === step.dependsOn.length
+      && dependencies.every(dependency => dependency?.state === 'completed')
+    const entry: PlanProgressEntry = {
+      step,
+      state: blockedBy.length > 0
+        ? 'failed'
+        : plan.status !== 'active'
+          ? 'failed'
+          : dependenciesComplete
+            ? 'ready'
+            : 'waiting',
+      childTask,
+      blockedBy,
+      resolution: blockedBy.length > 0
+        ? 'blocked'
+        : plan.status !== 'active'
+          ? 'stopped'
+          : undefined,
+      failureTone: blockedBy.length > 0 || plan.status !== 'active' ? 'warning' : undefined,
+    }
+    resolved.set(step.id, entry)
+    return entry
+  }
+  const entries = plan.steps.map(resolve)
+  const counts: Record<PlanProgressState, number> = {
+    completed: 0,
+    working: 0,
+    ready: 0,
+    waiting: 0,
+    failed: 0,
+  }
+  for (const entry of entries) counts[entry.state] += 1
+  return { entries, counts }
 }
 
 /** Aggregate plan progress and active child Agents for the supplied tasks. */
@@ -202,8 +333,41 @@ function newestTask(tasks: readonly DispatcherTask[]): DispatcherTask | undefine
   ), undefined)
 }
 
-function activeHeaderSummary(tasks: readonly DispatcherTask[], t: Translate): HeaderSummary {
-  const progress = planProgress(tasks)
+function topLevelTasks(tasks: readonly DispatcherTask[]): readonly DispatcherTask[] {
+  const taskIds = new Set(tasks.map(task => task.taskId))
+  return tasks.filter(task => (
+    task.orchestration === undefined || !taskIds.has(task.orchestration.parentTaskId)
+  ))
+}
+
+function tasksInRootForest(
+  roots: readonly DispatcherTask[],
+  tasks: readonly DispatcherTask[],
+): readonly DispatcherTask[] {
+  const rootIds = new Set(roots.map(task => task.taskId))
+  const byId = new Map(tasks.map(task => [task.taskId, task]))
+  return tasks.filter((task) => {
+    let current: DispatcherTask | undefined = task
+    const visited = new Set<string>()
+    while (current !== undefined && !visited.has(current.taskId)) {
+      if (rootIds.has(current.taskId)) return true
+      visited.add(current.taskId)
+      const parentTaskId: string | undefined = current.orchestration?.parentTaskId
+      current = parentTaskId === undefined ? undefined : byId.get(parentTaskId)
+    }
+    return false
+  })
+}
+
+function activeHeaderSummary(
+  tasks: readonly DispatcherTask[],
+  allTasks: readonly DispatcherTask[],
+  t: Translate,
+): HeaderSummary {
+  const rootProgress = planProgress(tasks)
+  const agents = tasksInRootForest(tasks, allTasks)
+    .reduce((count, task) => count + task.workers.filter(workerIsRunning).length, 0)
+  const progress = { ...rootProgress, agents }
   const newestUnplanned = newestTask(tasks.filter(task => task.masterPlan === undefined))
   const phase = newestUnplanned === undefined
     ? undefined
@@ -246,10 +410,11 @@ function terminalHeaderSummary(task: DispatcherTask, t: Translate): HeaderSummar
 }
 
 function headerSummary(state: DispatcherViewState, t: Translate): HeaderSummary {
-  const tasks = state.snapshot?.tasks
-  if (tasks !== undefined && tasks.length > 0) {
+  const snapshotTasks = state.snapshot?.tasks
+  if (snapshotTasks !== undefined && snapshotTasks.length > 0) {
+    const tasks = topLevelTasks(snapshotTasks)
     const active = tasks.filter(task => task.status === 'running')
-    if (active.length > 0) return activeHeaderSummary(active, t)
+    if (active.length > 0) return activeHeaderSummary(active, snapshotTasks, t)
     const latest = newestTask(tasks)
     if (latest !== undefined) return terminalHeaderSummary(latest, t)
   }
@@ -452,25 +617,115 @@ function HostSchedulerSummary({ childTasks, t }: {
   )
 }
 
-function StepRow({ childTask, dependencyLabels, step, workerLabel, workers, t }: {
+function ProgressFocus({ entries, focus, t }: {
+  readonly entries: readonly PlanProgressEntry[]
+  readonly focus: 'now' | 'ready' | 'waiting'
+  readonly t: Translate
+}) {
+  const state = focus === 'now' ? 'working' : focus
+  const matching = entries.filter(entry => entry.state === state)
+  const names = matching.map(entry => entry.step.title).join(' · ')
+  return (
+    <div data-progress-focus={focus}>
+      <dt>
+        <span>{t(`progress.focus.${focus}`)}</span>
+        <span aria-hidden="true">{matching.length}</span>
+      </dt>
+      <dd>{names === '' ? t(`progress.focus.${focus}.empty`) : names}</dd>
+    </div>
+  )
+}
+
+function ProgressOverview({ overview, scope, t }: {
+  readonly overview: PlanProgressOverview
+  readonly scope: PlanScope
+  readonly t: Translate
+}) {
+  const { counts, entries } = overview
+  const unit = scope === 'macro' ? 'nodes' : 'steps'
+  const aria = t(`progress.aria.${unit}`, {
+    total: entries.length,
+    completed: counts.completed,
+    working: counts.working,
+    ready: counts.ready,
+    waiting: counts.waiting,
+    failed: counts.failed,
+  })
+  const failureTone = entries.some(entry => (
+    entry.state === 'failed' && entry.failureTone === 'error'
+  )) ? 'error' : 'warning'
+  return (
+    <section className={css.progress} aria-label={aria} data-plan-progress>
+      <div className={css.progressHead}>
+        <strong>{t('progress.title')}</strong>
+        <span>{t(`progress.summary.${unit}`, { done: counts.completed, total: entries.length })}</span>
+      </div>
+      <ul className={css.progressTrack} aria-label={t(`progress.track.aria.${unit}`)}>
+        {PLAN_PROGRESS_STATES.filter(state => counts[state] > 0).map(state => {
+          const status = t(state === 'failed'
+            ? 'progress.status.failedGroup'
+            : `progress.status.${state}`)
+          const label = t(`progress.track.group.${unit}`, { status, count: counts[state] })
+          return (
+            <li
+              key={state}
+              data-progress-state={state}
+              data-progress-tone={state === 'failed' ? failureTone : undefined}
+              aria-label={label}
+              title={label}
+              style={{ flexGrow: counts[state] }}
+            >
+              <span className={css.srOnly}>{label}</span>
+            </li>
+          )
+        })}
+      </ul>
+      <ul className={css.progressLegend} aria-label={t(`progress.legend.aria.${unit}`)}>
+        {PLAN_PROGRESS_STATES.map(progressState => (
+          <li
+            key={progressState}
+            data-progress-state={progressState}
+            data-progress-tone={progressState === 'failed' ? failureTone : undefined}
+          >
+            <span aria-hidden="true" />
+            <span>{t(progressState === 'failed'
+              ? 'progress.status.failedGroup'
+              : `progress.status.${progressState}`)}</span>
+            <strong>{counts[progressState]}</strong>
+          </li>
+        ))}
+      </ul>
+      <dl className={css.progressFocus}>
+        <ProgressFocus entries={entries} focus="now" t={t} />
+        <ProgressFocus entries={entries} focus="ready" t={t} />
+        <ProgressFocus entries={entries} focus="waiting" t={t} />
+      </dl>
+      <p className={css.progressHint}>{t(`progress.hint.${unit}`)}</p>
+    </section>
+  )
+}
+
+function StepRow({ childTask, childTasksByParent, dependencyLabels, progressEntry, step, taskTitles, workerLabel, workers, t }: {
   readonly childTask?: DispatcherTask
+  readonly childTasksByParent: ReadonlyMap<string, readonly DispatcherTask[]>
   readonly dependencyLabels: readonly string[]
+  readonly progressEntry: PlanProgressEntry
   readonly step: DispatcherPlanStep
+  readonly taskTitles: ReadonlyMap<string, string>
   readonly workerLabel: string
   readonly workers: readonly DispatcherWorker[]
   readonly t: Translate
 }) {
-  const terminalChild = step.status === 'completed'
-    || childTask === undefined
-    || childTask.status === 'running'
-    ? undefined
-    : childTask
-  const visibleStatus = terminalChild?.status ?? step.status
+  const terminalChild = step.status !== 'completed' && childHasFailed(childTask)
+    ? childTask
+    : undefined
+  const visibleStatus = terminalChild?.status
+    ?? (progressEntry.blockedBy.length > 0 ? 'blocked' : progressEntry.state)
   const visibleStatusLabel = terminalChild === undefined
-    ? t(STEP_STATUS_KEYS[step.status])
+    ? progressLabel(progressEntry, t)
     : t(TASK_STATUS_KEYS[terminalChild.status])
   const visibleStatusDot = terminalChild === undefined
-    ? stepDot(step.status)
+    ? progressDot(progressEntry)
     : taskDot(terminalChild.status)
   const dependencies = dependencyLabels.join(', ')
   const dependencyText = dependencyLabels.length === 0
@@ -480,7 +735,12 @@ function StepRow({ childTask, dependencyLabels, step, workerLabel, workers, t }:
     ? t('step.dependency.aria.none', { step: step.id })
     : t('step.dependency.aria.some', { step: step.id, ids: dependencies })
   return (
-    <li className={css.step} data-step-status={visibleStatus}>
+    <li
+      className={css.step}
+      data-step-status={visibleStatus}
+      data-progress-state={progressEntry.state}
+      data-progress-tone={progressEntry.failureTone}
+    >
       <div className={css.stepRail}><StateDot state={visibleStatusDot} /></div>
       <div className={css.stepBody}>
         <div className={css.stepHead}>
@@ -494,6 +754,19 @@ function StepRow({ childTask, dependencyLabels, step, workerLabel, workers, t }:
           <span>{t('step.attempts', { count: step.attempts })}</span>
         </div>
         <WorkerList label={workerLabel} scope={step.title} workers={workers} t={t} />
+        {childTask === undefined ? null : (
+          <ul className={css.nestedTasks} aria-label={t('orchestration.children.aria', { step: step.title })}>
+            <TaskCard
+              task={childTask}
+              childTasks={childTasksByParent.get(childTask.taskId) ?? []}
+              childTasksByParent={childTasksByParent}
+              nested
+              parentTitle={taskTitles.get(childTask.orchestration?.parentTaskId ?? '')}
+              taskTitles={taskTitles}
+              t={t}
+            />
+          </ul>
+        )}
       </div>
     </li>
   )
@@ -510,17 +783,21 @@ function PlanContext({ scope, t }: { readonly scope: PlanScope; readonly t: Tran
   )
 }
 
-function PlanBody({ childTasks, plan, scope, task, t }: {
+function PlanBody({ childTasks, childTasksByParent, plan, scope, task, taskTitles, t }: {
   readonly childTasks: readonly DispatcherTask[]
+  readonly childTasksByParent: ReadonlyMap<string, readonly DispatcherTask[]>
   readonly plan: DispatcherMasterPlan
   readonly scope: PlanScope
   readonly task: DispatcherTask
+  readonly taskTitles: ReadonlyMap<string, string>
   readonly t: Translate
 }) {
   const stepTitles = new Map(plan.steps.map(step => [step.id, step.title]))
   const childByNode = new Map(childTasks.flatMap(child => (
     child.orchestration === undefined ? [] : [[child.orchestration.nodeId, child] as const]
   )))
+  const progress = derivePlanProgress(plan, childTasks)
+  const progressByStep = new Map(progress.entries.map(entry => [entry.step.id, entry]))
   const stepsAria = scope === 'macro'
     ? t('steps.aria.macro', { task: task.title })
     : scope === 'node-local'
@@ -546,34 +823,87 @@ function PlanBody({ childTasks, plan, scope, task, t }: {
       {plan.steps.length === 0
         ? <p className={css.emptySteps}>{t('steps.empty')}</p>
         : (
-          <ol className={css.steps} aria-label={stepsAria}>
-            {plan.steps.map(step => (
-              <StepRow
-                key={step.id}
-                childTask={childByNode.get(step.id)}
-                step={step}
-                dependencyLabels={step.dependsOn.map((dependencyId) => {
-                  const title = stepTitles.get(dependencyId)
-                  return title === undefined ? dependencyId : `${title} (${dependencyId})`
-                })}
-                workerLabel={stepWorkerLabel}
-                workers={task.workers.filter(worker => worker.stepId === step.id)}
-                t={t}
-              />
-            ))}
-          </ol>
+          <>
+            <ProgressOverview overview={progress} scope={scope} t={t} />
+            <ol className={css.steps} aria-label={stepsAria}>
+              {plan.steps.map(step => (
+                <StepRow
+                  key={step.id}
+                  childTask={childByNode.get(step.id)}
+                  childTasksByParent={childTasksByParent}
+                  step={step}
+                  taskTitles={taskTitles}
+                  progressEntry={progressByStep.get(step.id) ?? {
+                    step,
+                    state: 'waiting',
+                    blockedBy: [],
+                  }}
+                  dependencyLabels={step.dependsOn.map((dependencyId) => {
+                    const title = stepTitles.get(dependencyId)
+                    return title === undefined ? dependencyId : `${title} (${dependencyId})`
+                  })}
+                  workerLabel={stepWorkerLabel}
+                  workers={task.workers.filter(worker => worker.stepId === step.id)}
+                  t={t}
+                />
+              ))}
+            </ol>
+          </>
         )}
     </div>
   )
 }
 
-function TaskCard({ childTasks, parentTitle, task, t }: {
-  readonly childTasks: readonly DispatcherTask[]
-  readonly parentTitle?: string
-  readonly task: DispatcherTask
+function ResultSummary({ result, t }: {
+  readonly result: NonNullable<DispatcherTask['result']>
   readonly t: Translate
 }) {
-  const [open, setOpen] = useState(task.status === 'running')
+  const verified = t(result.modelVerified
+    ? 'task.result.modelVerified.yes'
+    : 'task.result.modelVerified.no')
+  const failure = t(`task.result.failureClass.${result.failureClass}`)
+  const workspace = t(result.workspaceQuarantined
+    ? 'task.result.workspaceQuarantined.yes'
+    : 'task.result.workspaceQuarantined.no')
+  return (
+    <section
+      className={css.result}
+      data-result-status={result.status}
+      data-result-model-verified={result.modelVerified}
+      data-result-failure-class={result.failureClass}
+      data-result-workspace-quarantined={result.workspaceQuarantined}
+      aria-label={t('task.result.aria', {
+        status: t(TASK_STATUS_KEYS[result.status]),
+        verified,
+        failure,
+        workspace,
+      })}
+    >
+      <div className={css.resultHead}>
+        <h4>{t('task.result')}</h4>
+        <ul className={css.resultFacts} aria-label={t('task.result.facts.aria')}>
+          <li>{verified}</li>
+          <li>{failure}</li>
+          <li data-quarantined={result.workspaceQuarantined}>{workspace}</li>
+        </ul>
+      </div>
+      {result.message === '' ? null : <p>{result.message}</p>}
+    </section>
+  )
+}
+
+function TaskCard({ childTasks, childTasksByParent, nested, parentTitle, task, taskTitles, t }: {
+  readonly childTasks: readonly DispatcherTask[]
+  readonly childTasksByParent: ReadonlyMap<string, readonly DispatcherTask[]>
+  readonly nested: boolean
+  readonly parentTitle?: string
+  readonly task: DispatcherTask
+  readonly taskTitles: ReadonlyMap<string, string>
+  readonly t: Translate
+}) {
+  const [open, setOpen] = useState(nested
+    ? task.status !== 'running' && task.status !== 'accepted'
+    : task.status !== 'accepted')
   const stepIds = new Set(task.masterPlan?.steps.map(step => step.id) ?? [])
   const taskWorkers = task.workers.filter(worker => worker.stepId === undefined || !stepIds.has(worker.stepId))
   const scope = planScope(task, childTasks)
@@ -617,6 +947,9 @@ function TaskCard({ childTasks, parentTitle, task, t }: {
               </>
             )}
           </div>
+          {task.result === undefined
+            ? null
+            : <ResultSummary result={task.result} t={t} />}
           {task.distribution === undefined
             ? null
             : <DistributionSummary distribution={task.distribution} t={t} />}
@@ -631,14 +964,18 @@ function TaskCard({ childTasks, parentTitle, task, t }: {
                       ? 'task.noPlan.node'
                       : 'task.noPlan',
               )}</p>
-            : <PlanBody childTasks={childTasks} plan={task.masterPlan} scope={scope} task={task} t={t} />}
+            : (
+              <PlanBody
+                childTasks={childTasks}
+                childTasksByParent={childTasksByParent}
+                plan={task.masterPlan}
+                scope={scope}
+                task={task}
+                taskTitles={taskTitles}
+                t={t}
+              />
+            )}
           <HostSchedulerSummary childTasks={childTasks} t={t} />
-          {task.result === undefined || task.result.message === '' ? null : (
-            <section className={css.result}>
-              <h4>{t('task.result')}</h4>
-              <p>{task.result.message}</p>
-            </section>
-          )}
         </div>
       </DisclosureRow>
     </li>
@@ -650,10 +987,11 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
   const state = useTaskDispatcher(value => value)
   const [open, setOpen] = useState(false)
   const tasks = state.snapshot?.tasks ?? []
-  const orderedTasks = useMemo(() => [...tasks].sort((left, right) => {
+  const rootTasks = useMemo(() => topLevelTasks(tasks), [tasks])
+  const orderedTasks = useMemo(() => [...rootTasks].sort((left, right) => {
     if ((left.status === 'running') !== (right.status === 'running')) return left.status === 'running' ? -1 : 1
     return right.updatedAt - left.updatedAt
-  }), [tasks])
+  }), [rootTasks])
   const taskTitles = useMemo(() => new Map(tasks.map(task => [task.taskId, task.title])), [tasks])
   const childTasksByParent = useMemo(() => {
     const byParent = new Map<string, DispatcherTask[]>()
@@ -667,8 +1005,8 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
     return byParent
   }, [tasks])
   const summary = headerSummary(state, t)
-  const runningTasks = tasks.filter(task => task.status === 'running')
-  const latestTerminal = newestTask(tasks)
+  const runningTasks = rootTasks.filter(task => task.status === 'running')
+  const latestTerminal = newestTask(rootTasks)
   const connection = connectionSummary(state, t)
   const accessibleSummary = connection === undefined
     ? summary.accessible
@@ -720,9 +1058,12 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
                         key={task.taskId}
                         task={task}
                         childTasks={childTasksByParent.get(task.taskId) ?? []}
+                        childTasksByParent={childTasksByParent}
+                        nested={false}
                         parentTitle={task.orchestration === undefined
                           ? undefined
                           : taskTitles.get(task.orchestration.parentTaskId)}
+                        taskTitles={taskTitles}
                         t={t}
                       />
                     ))}

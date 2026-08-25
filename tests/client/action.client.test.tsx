@@ -2,7 +2,12 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { TaskDispatcherAction, planProgress, type TaskDispatcherActionProps } from '../../src/client/TaskDispatcherAction.tsx'
+import {
+  TaskDispatcherAction,
+  derivePlanProgress,
+  planProgress,
+  type TaskDispatcherActionProps,
+} from '../../src/client/TaskDispatcherAction.tsx'
 import { en, zh } from '../../src/client/locales.ts'
 import type { DispatcherSnapshot, DispatcherTask, DispatcherViewState } from '../../src/client/types.ts'
 
@@ -236,6 +241,31 @@ describe('TaskDispatcherAction', () => {
     expect(trigger.querySelector('[data-state="error"]')).toBeTruthy()
   })
 
+  it('opens non-accepted history with verification, failure, and quarantine facts first', () => {
+    render(<TaskDispatcherAction {...props(stateWithTasks([task({
+      status: 'error',
+      phase: 'finished',
+      masterPlan: undefined,
+      workers: [],
+      result: {
+        status: 'error',
+        message: 'Evidence exceeded the configured result limit.',
+        modelVerified: false,
+        workspaceQuarantined: true,
+        failureClass: 'infrastructure',
+      },
+    })]))} />)
+    fireEvent.click(screen.getByRole('button', { name: /打开任务执行计划/u }))
+
+    const result = screen.getByRole('region', {
+      name: '执行结果：异常；未经模型验收；基础设施失败；工作区已隔离',
+    })
+    expect(result.getAttribute('data-result-model-verified')).toBe('false')
+    expect(result.getAttribute('data-result-failure-class')).toBe('infrastructure')
+    expect(result.getAttribute('data-result-workspace-quarantined')).toBe('true')
+    expect(within(result).getByText('Evidence exceeded the configured result limit.')).toBeTruthy()
+  })
+
   it('opens an expanded task with an accessible vertical dependency chain and worker facts', () => {
     render(<TaskDispatcherAction {...props(state())} />)
     fireEvent.click(screen.getByRole('button'))
@@ -253,6 +283,10 @@ describe('TaskDispatcherAction', () => {
     expect(within(dialog).queryByText(zh['plan.scope.macro.title'])).toBeNull()
     expect(within(dialog).queryByText(zh['plan.scope.node.title'])).toBeNull()
     expect(document.querySelector('[data-plan-scope="linear"]')).toBeTruthy()
+    expect(within(dialog).getByRole('region', {
+      name: '步骤工作进度：共 2 个步骤；已完成 1；工作中 1；可开始 0；等待中 0；失败、受阻或未完成 0',
+    })).toBeTruthy()
+    expect(within(dialog).getByRole('list', { name: '计划步骤状态构成分段轨' })).toBeTruthy()
   })
 
   it('recognizes an unambiguously parallel macro DAG before its first child starts', () => {
@@ -273,12 +307,22 @@ describe('TaskDispatcherAction', () => {
 
     expect(screen.getByText(zh['plan.scope.macro.title'])).toBeTruthy()
     expect(screen.getByRole('list', { name: '“正在审核宏观计划”宏观 DAG 的契约节点' })).toBeTruthy()
+    expect(screen.getByRole('region', {
+      name: '节点工作进度：共 2 个节点；已完成 0；工作中 0；可开始 2；等待中 0；失败、受阻或未完成 0',
+    })).toBeTruthy()
     expect(screen.queryByRole('region', { name: /Host Ready Queue/u })).toBeNull()
     expect(screen.queryByText(zh['task.orchestration.workerScope'])).toBeNull()
   })
 
   it('labels recursive child tasks with their verified parent DAG node', () => {
-    const parent = task({ taskId: 'task-root', title: '根任务' })
+    const parent = task({
+      taskId: 'task-root',
+      title: '根任务',
+      masterPlan: {
+        planId: 'macro-plan', revision: 1, patchCount: 0, status: 'active', summary: '',
+        steps: [{ id: 'inspect', title: '检查页面', objective: '', status: 'working', attempts: 1, dependsOn: [] }],
+      },
+    })
     const child = task({
       taskId: 'task-child',
       title: '检查页面',
@@ -287,11 +331,19 @@ describe('TaskDispatcherAction', () => {
     render(<TaskDispatcherAction {...props(stateWithTasks([parent, child]))} />)
     fireEvent.click(screen.getByRole('button'))
 
+    const roots = screen.getByRole('list', { name: zh['tasks.aria'] })
+    expect(roots.querySelectorAll(':scope > li')).toHaveLength(1)
+    const nested = screen.getByRole('list', { name: '宏观节点“检查页面”的 Worker 任务' })
+    const nestedTrigger = within(nested).getByRole('button', { name: /检查页面/u })
+    expect(nestedTrigger.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(nestedTrigger)
     expect(screen.getByText('父任务：根任务 · 节点 inspect · 深度 1')).toBeTruthy()
     expect(screen.getByText(zh['task.orchestration.workerScope'])).toBeTruthy()
+    expect(screen.getByRole('button', { name: /打开任务执行计划/u }).textContent)
+      .toContain('计划 0/1 · 2 个 Agent 运行')
   })
 
-  it('separates the macro DAG, node-local Worker pipelines, and continuously refilled Host Ready Queue', () => {
+  it('separates the macro DAG, embedded node-local Worker pipelines, and reported running Host tasks', () => {
     const parent = task({
       taskId: 'task-root',
       title: '根任务',
@@ -320,13 +372,23 @@ describe('TaskDispatcherAction', () => {
 
     expect(screen.getByText(zh['plan.scope.macro.title'])).toBeTruthy()
     expect(screen.getByText(zh['plan.scope.macro.description'])).toBeTruthy()
+    const inspectTask = within(screen.getByRole('list', {
+      name: '宏观节点“页面检查”的 Worker 任务',
+    })).getByRole('button', { name: /页面检查/u })
+    const crossCheckTask = within(screen.getByRole('list', {
+      name: '宏观节点“事实交叉检查”的 Worker 任务',
+    })).getByRole('button', { name: /事实交叉检查/u })
+    expect(inspectTask.getAttribute('aria-expanded')).toBe('false')
+    expect(crossCheckTask.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(inspectTask)
+    fireEvent.click(crossCheckTask)
     expect(screen.getAllByText(zh['plan.scope.node.title'])).toHaveLength(2)
     expect(screen.getAllByText(zh['plan.scope.node.description'])).toHaveLength(2)
     expect(screen.getByRole('list', { name: '“根任务”宏观 DAG 的契约节点' })).toBeTruthy()
     expect(screen.getByRole('list', { name: '“页面检查”Worker 节点内的局部流水线' })).toBeTruthy()
 
     const scheduler = screen.getByRole('region', {
-      name: 'Host Ready Queue 持续补位：2 个本地任务节点并发运行',
+      name: 'Host Ready Queue：2 个本地任务节点运行中',
     })
     expect(scheduler.getAttribute('data-orchestration-active-nodes')).toBe('2')
     expect(scheduler.getAttribute('data-orchestration-scheduling')).toBe('continuous-ready-queue')
@@ -334,7 +396,8 @@ describe('TaskDispatcherAction', () => {
     expect(within(nodes).getByLabelText('任务节点 inspect，页面检查，节点内阶段：执行步骤')).toBeTruthy()
     expect(within(nodes).getByLabelText('任务节点 cross-check，事实交叉检查，节点内阶段：验收步骤')).toBeTruthy()
     expect(within(scheduler).getByText(zh['orchestration.scheduler.hint'])).toBeTruthy()
-    expect(within(scheduler).getByText(/本地只读/u)).toBeTruthy()
+    expect(within(scheduler).getByText(/等待其递归子节点汇合/u)).toBeTruthy()
+    expect(screen.queryByText(/执行槽位/u)).toBeNull()
   })
 
   it('shows a terminal Worker failure on its macro node instead of leaving it visually pending', () => {
@@ -359,13 +422,75 @@ describe('TaskDispatcherAction', () => {
     fireEvent.click(screen.getByRole('button'))
 
     const plan = screen.getByRole('list', { name: '“根任务”宏观 DAG 的契约节点' })
-    expect(within(plan).getByText(zh['task.status.rejected'])).toBeTruthy()
-    expect(plan.querySelector('[data-step-status="rejected"]')).toBeTruthy()
-    expect(within(plan).queryByText(zh['step.status.pending'])).toBeNull()
+    expect(within(plan).getAllByText(zh['task.status.rejected'])).toHaveLength(2)
+    expect(within(screen.getByRole('list', {
+      name: '宏观节点“页面检查”的 Worker 任务',
+    })).getByRole('button', { name: /页面检查/u }).getAttribute('aria-expanded')).toBe('true')
+    const failedStep = plan.querySelector<HTMLElement>('[data-step-status="rejected"]')
+    expect(failedStep).toBeTruthy()
+    const failedStepHead = failedStep?.children.item(1)?.children.item(0)
+    expect(failedStepHead?.textContent).toContain(zh['task.status.rejected'])
+    expect(failedStepHead?.textContent).not.toContain(zh['step.status.pending'])
+  })
+
+  it('shows truthful five-state node distribution and recursively propagated dependency failures', () => {
+    const parent = task({
+      taskId: 'task-root',
+      title: '宏观任务',
+      workers: [],
+      masterPlan: {
+        planId: 'five-state-plan', revision: 1, patchCount: 0, status: 'active', summary: '',
+        steps: [
+          { id: 'done', title: '已封存', objective: '', status: 'completed', attempts: 1, dependsOn: [] },
+          { id: 'working', title: '正在执行', objective: '', status: 'working', attempts: 1, dependsOn: ['done'] },
+          { id: 'joining', title: '正在汇合', objective: '', status: 'pending', attempts: 1, dependsOn: [] },
+          { id: 'ready', title: '依赖就绪', objective: '', status: 'pending', attempts: 0, dependsOn: ['done'] },
+          { id: 'waiting', title: '等待执行节点', objective: '', status: 'pending', attempts: 0, dependsOn: ['working'] },
+          { id: 'fail', title: '直接失败', objective: '', status: 'pending', attempts: 1, dependsOn: [] },
+          { id: 'blocked', title: '直接受阻', objective: '', status: 'pending', attempts: 0, dependsOn: ['fail'] },
+          { id: 'blocked-deep', title: '递归受阻', objective: '', status: 'pending', attempts: 0, dependsOn: ['blocked'] },
+        ],
+      },
+    })
+    const failed = task({
+      taskId: 'task-fail', title: '直接失败', status: 'rejected', phase: 'finished', workers: [],
+      orchestration: { parentTaskId: 'task-root', nodeId: 'fail', depth: 1 },
+    })
+    const joining = task({
+      taskId: 'task-joining', title: '正在汇合', status: 'accepted', phase: 'finished', workers: [],
+      orchestration: { parentTaskId: 'task-root', nodeId: 'joining', depth: 1 },
+    })
+    render(<TaskDispatcherAction {...props(stateWithTasks([parent, failed, joining]))} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    const progress = screen.getByRole('region', {
+      name: '节点工作进度：共 8 个节点；已完成 1；工作中 2；可开始 1；等待中 1；失败、受阻或未完成 3',
+    })
+    const track = within(progress).getByRole('list', { name: '计划节点状态构成分段轨' })
+    expect(track.querySelectorAll(':scope > li')).toHaveLength(5)
+    expect(within(track).getByLabelText('失败 / 受阻 / 未收口：3 个节点')).toBeTruthy()
+    expect(progress.querySelector('[data-progress-focus="now"]')?.textContent)
+      .toContain('正在执行 · 正在汇合')
+    expect(progress.querySelector('[data-progress-focus="ready"]')?.textContent).toContain('依赖就绪')
+    expect(progress.querySelector('[data-progress-focus="waiting"]')?.textContent).toContain('等待执行节点')
+
+    const plan = screen.getByRole('list', { name: '“宏观任务”宏观 DAG 的契约节点' })
+    expect(within(screen.getByRole('list', {
+      name: '宏观节点“正在汇合”的 Worker 任务',
+    })).getByRole('button', { name: /正在汇合/u }).getAttribute('aria-expanded')).toBe('false')
+    expect(within(plan).getAllByText('被失败依赖阻塞：fail')).toHaveLength(2)
+    expect(within(plan).getByText(zh['progress.status.joining'])).toBeTruthy()
   })
 
   it('renders the orchestration hierarchy labels in English', () => {
-    const parent = task({ taskId: 'task-root', title: 'Root task' })
+    const parent = task({
+      taskId: 'task-root',
+      title: 'Root task',
+      masterPlan: {
+        planId: 'macro-plan', revision: 1, patchCount: 0, status: 'active', summary: '',
+        steps: [{ id: 'inspect', title: 'Inspect page', objective: '', status: 'working', attempts: 1, dependsOn: [] }],
+      },
+    })
     const child = task({
       taskId: 'task-child',
       title: 'Inspect page',
@@ -375,9 +500,11 @@ describe('TaskDispatcherAction', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getByText(en['plan.scope.macro.title'])).toBeTruthy()
+    const nested = screen.getByRole('list', { name: 'Worker task for macro node “Inspect page”' })
+    fireEvent.click(within(nested).getByRole('button', { name: /Inspect page/u }))
     expect(screen.getByText(en['plan.scope.node.title'])).toBeTruthy()
     expect(screen.getByRole('region', {
-      name: 'Host Ready Queue with continuous slot refill: 1 local task node running',
+      name: 'Host Ready Queue: 1 local task node running',
     })).toBeTruthy()
     expect(screen.getByText(en['task.orchestration.workerScope'])).toBeTruthy()
   })
@@ -515,5 +642,73 @@ describe('planProgress', () => {
       workers: [{ ...first.workers[1]!, workerId: 'cleanup', status: 'cleanup' }],
     })
     expect(planProgress([first, second])).toEqual({ done: 2, total: 3, agents: 1 })
+  })
+})
+
+describe('derivePlanProgress', () => {
+  it('does not count an accepted child until the parent plan seals its step', () => {
+    const acceptedChild = task({
+      taskId: 'task-child', status: 'accepted', phase: 'finished', workers: [],
+      orchestration: { parentTaskId: 'task-root', nodeId: 'node', depth: 1 },
+    })
+    const activePlan = {
+      planId: 'plan', revision: 1, patchCount: 0, status: 'active' as const, summary: '',
+      steps: [{ id: 'node', title: 'Node', objective: '', status: 'pending' as const, attempts: 1, dependsOn: [] }],
+    }
+
+    const joining = derivePlanProgress(activePlan, [acceptedChild])
+    expect(joining.counts).toEqual({ completed: 0, working: 1, ready: 0, waiting: 0, failed: 0 })
+    expect(joining.entries[0]).toMatchObject({ state: 'working', resolution: 'joining' })
+
+    const terminal = derivePlanProgress({ ...activePlan, status: 'error' }, [acceptedChild])
+    expect(terminal.counts).toEqual({ completed: 0, working: 0, ready: 0, waiting: 0, failed: 1 })
+    expect(terminal.entries[0]).toMatchObject({
+      state: 'failed', resolution: 'unsealed', failureTone: 'warning',
+    })
+  })
+
+  it('keeps terminal unfinished work out of working, ready, and waiting states', () => {
+    const terminal = derivePlanProgress({
+      planId: 'terminal', revision: 1, patchCount: 0, status: 'cancelled', summary: '',
+      steps: [
+        { id: 'working', title: 'Working', objective: '', status: 'working', attempts: 1, dependsOn: [] },
+        { id: 'pending', title: 'Pending', objective: '', status: 'pending', attempts: 0, dependsOn: ['working'] },
+      ],
+    }, [])
+
+    expect(terminal.counts).toEqual({ completed: 0, working: 0, ready: 0, waiting: 0, failed: 2 })
+    expect(terminal.entries.map(entry => entry.resolution)).toEqual(['stopped', 'stopped'])
+    expect(terminal.entries.map(entry => entry.blockedBy)).toEqual([[], []])
+    expect(terminal.entries.every(entry => entry.failureTone === 'warning')).toBe(true)
+  })
+
+  it('propagates sorted root failure IDs while keeping blocked and cancelled nodes non-error toned', () => {
+    const plan = {
+      planId: 'blocked', revision: 1, patchCount: 0, status: 'active' as const, summary: '',
+      steps: [
+        { id: 'z-fail', title: 'Z', objective: '', status: 'pending' as const, attempts: 1, dependsOn: [] },
+        { id: 'a-cancel', title: 'A', objective: '', status: 'pending' as const, attempts: 1, dependsOn: [] },
+        { id: 'middle', title: 'Middle', objective: '', status: 'pending' as const, attempts: 0, dependsOn: ['z-fail', 'a-cancel'] },
+        { id: 'leaf', title: 'Leaf', objective: '', status: 'pending' as const, attempts: 0, dependsOn: ['middle'] },
+      ],
+    }
+    const rejected = task({
+      taskId: 'z', status: 'rejected', phase: 'finished', workers: [],
+      orchestration: { parentTaskId: 'root', nodeId: 'z-fail', depth: 1 },
+    })
+    const cancelled = task({
+      taskId: 'a', status: 'cancelled', phase: 'finished', workers: [],
+      orchestration: { parentTaskId: 'root', nodeId: 'a-cancel', depth: 1 },
+    })
+
+    const overview = derivePlanProgress(plan, [rejected, cancelled])
+    expect(overview.entries[0]).toMatchObject({ failureTone: 'error', resolution: 'direct-failure' })
+    expect(overview.entries[1]).toMatchObject({ failureTone: 'warning', resolution: 'direct-failure' })
+    expect(overview.entries[2]).toMatchObject({
+      state: 'failed', resolution: 'blocked', failureTone: 'warning', blockedBy: ['a-cancel', 'z-fail'],
+    })
+    expect(overview.entries[3]).toMatchObject({
+      state: 'failed', resolution: 'blocked', blockedBy: ['a-cancel', 'z-fail'],
+    })
   })
 })

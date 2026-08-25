@@ -89,6 +89,7 @@
 }
 
 .tasks,
+.nestedTasks,
 .workers,
 .steps {
   margin: 0;
@@ -100,6 +101,19 @@
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.nestedTasks {
+  margin-top: 10px;
+}
+
+.nestedTasks .task {
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-module-platform);
+}
+
+.nestedTasks .taskBody {
+  padding-left: 30px;
 }
 
 .task {
@@ -304,6 +318,184 @@
   margin: 0;
 }
 
+.progress {
+  min-width: 0;
+  padding: 11px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-module-platform);
+}
+
+.progressHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.progressHead strong {
+  color: var(--dsw-alias-label-primary);
+  font-size: 12px;
+  font-weight: 510;
+  line-height: 18px;
+}
+
+.progressHead span {
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.progressTrack {
+  display: flex;
+  gap: 3px;
+  height: 8px;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.progressTrack li {
+  flex-basis: 0;
+  min-width: 8px;
+  border-radius: 999px;
+  background: var(--dsw-alias-fill-l2);
+}
+
+.progressTrack li[data-progress-state='completed'],
+.progressLegend li[data-progress-state='completed'] > span:first-child {
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.progressTrack li[data-progress-state='working'],
+.progressLegend li[data-progress-state='working'] > span:first-child {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--dsw-alias-state-business-primary) 0 3px,
+    var(--dsw-alias-fill-l2) 3px 6px
+  );
+}
+
+.progressTrack li[data-progress-state='ready'],
+.progressLegend li[data-progress-state='ready'] > span:first-child {
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-state-business-primary);
+  background: transparent;
+}
+
+.progressTrack li[data-progress-state='waiting'],
+.progressLegend li[data-progress-state='waiting'] > span:first-child {
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-border-l2);
+  background: var(--dsw-alias-fill-l2);
+}
+
+.progressTrack li[data-progress-state='failed'][data-progress-tone='error'],
+.progressLegend li[data-progress-state='failed'][data-progress-tone='error'] > span:first-child {
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.progressTrack li[data-progress-state='failed'][data-progress-tone='warning'],
+.progressLegend li[data-progress-state='failed'][data-progress-tone='warning'] > span:first-child {
+  box-shadow: inset 0 0 0 1px var(--dsw-alias-label-secondary);
+  background: var(--dsw-alias-fill-l2);
+}
+
+.progressLegend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 11px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.progressLegend li {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 17px;
+}
+
+.progressLegend li > span:first-child {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 2px;
+}
+
+.progressLegend strong {
+  color: var(--dsw-alias-label-secondary);
+  font-weight: 510;
+}
+
+.progressFocus {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+  margin: 10px 0 0;
+}
+
+.progressFocus > div {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-layer-1);
+}
+
+.progressFocus dt,
+.progressFocus dd {
+  margin: 0;
+}
+
+.progressFocus dt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  font-weight: 510;
+  line-height: 16px;
+}
+
+.progressFocus dt > span:last-child {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--dsw-alias-fill-l2);
+  color: var(--dsw-alias-label-secondary);
+  text-align: center;
+}
+
+.progressFocus dd {
+  padding-top: 3px;
+  color: var(--dsw-alias-label-secondary);
+  font-size: 11px;
+  line-height: 17px;
+  overflow-wrap: anywhere;
+}
+
+.progressHint {
+  margin: 8px 0 0;
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.srOnly {
+  position: absolute;
+  overflow: hidden;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  margin: -1px;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
 .planContext h4 {
   color: var(--dsw-alias-label-primary);
   font-size: 12px;
@@ -474,6 +666,10 @@
   transform: translateX(-50%);
 }
 
+.plan[data-plan-scope='macro'] .stepRail::after {
+  display: none;
+}
+
 .stepRail > * {
   position: relative;
   z-index: 1;
@@ -509,6 +705,15 @@
   color: var(--dsw-alias-label-secondary);
   font-size: 11px;
   line-height: 18px;
+}
+
+.step[data-progress-state='working'] .stepStatus,
+.step[data-progress-state='ready'] .stepStatus {
+  color: var(--dsw-alias-state-business-primary);
+}
+
+.step[data-progress-state='failed'][data-progress-tone='error'] .stepStatus {
+  color: var(--dsw-alias-state-error-primary);
 }
 
 .stepObjective {
@@ -630,11 +835,55 @@
 
 .result {
   padding: 9px 11px;
+  border: 1px solid var(--dsw-alias-border-l2);
   border-radius: 8px;
   background: var(--dsw-alias-fill-l2);
 }
 
+.result[data-result-status='rejected'],
+.result[data-result-status='error'] {
+  border-color: var(--dsw-alias-state-error-primary);
+}
+
+.resultHead {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.resultHead h4 {
+  flex: none;
+  margin: 1px 0 0;
+}
+
+.resultFacts {
+  display: flex;
+  flex: 1;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.resultFacts li {
+  padding: 1px 6px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  background: var(--dsw-alias-bg-layer-1);
+  color: var(--dsw-alias-label-secondary);
+  font-size: 10px;
+  line-height: 16px;
+}
+
+.resultFacts li[data-quarantined='true'] {
+  border-color: var(--dsw-alias-state-error-primary);
+  color: var(--dsw-alias-state-error-primary);
+}
+
 .result p {
+  padding-top: 7px;
   color: var(--dsw-alias-label-secondary);
   font-size: 12px;
   line-height: 18px;
@@ -693,5 +942,28 @@
 
   .workerFacts > div {
     grid-template-columns: 80px minmax(0, 1fr);
+  }
+
+  .progressHead {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .progressFocus {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .nestedTasks .taskBody {
+    padding-right: 8px;
+    padding-left: 22px;
+  }
+
+  .resultHead {
+    flex-direction: column;
+  }
+
+  .resultFacts {
+    justify-content: flex-start;
   }
 }

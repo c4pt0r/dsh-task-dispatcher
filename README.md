@@ -745,27 +745,42 @@ needed on that node.
 
 The bundle includes a Web client module. Each conversation header gets a
 compact summary such as `Plan 2/5 · 1 active Agent`. The summary prioritizes
-tasks that are still running: it aggregates only their plan steps and counts
-active child Agents (not distinct model routes). Before a local master plan
-exists, it shows the task's current phase, such as `Creating initial plan`,
-instead of the misleading `Plan 0/0`. When no task is running, it shows only
-the newest terminal task's status and plan progress rather than accumulating
-history. Open it to see:
+root tasks that are still running: plan totals count only their macro or linear
+steps, while the Agent count includes active descendants without counting the
+same work again through each Worker-local plan. Before a local master plan
+exists, it shows the root task's current phase, such as `Creating initial
+plan`, instead of the misleading `Plan 0/0`. When no root task is running, it
+shows only the newest terminal root's status and plan progress rather than
+accumulating history. Open it to see:
 
-- every recent or active dispatcher task in that exact Session;
+- every recent or active root dispatcher task in that exact Session, with each
+  recursive Worker task nested under its owning macro node;
 - for a durable task, its pool, queued/running/terminal placement state, remote
   node id, delivery count, lease generation and expiry, and cancellation flag;
-- for a local task, the current master-plan revision and completed-step count;
-- for a local task, each step's prerequisite, displayed as a vertical
-  dependency chain;
+- for a local task, a node-count state composition plus **working now**,
+  **dependencies met**, and **waiting on dependencies** summaries; only a Host
+  `completed` step counts as completed, so an accepted child remains
+  `joining` until its parent seals the evidence;
+- for a local linear task, each step's prerequisite as a vertical dependency
+  chain; macro DAG nodes are a semantic list and are never connected merely
+  because they are adjacent in the planner's array;
 - for an orchestration parent, an explicit **Master Plan / macro DAG** label
-  and the ready nodes currently selected by Host scheduling;
+  with recursive dependency-failure propagation and the local node tasks the
+  Host currently reports as running;
 - for an orchestration child, an explicit **Worker node-local execution** label
   rather than presenting its private pipeline as another global plan;
 - for a local task, the planner, executor, reviewer, or verifier attached to
   each step, plus the child Agent id and selected provider/model; and
 - reconnecting, blocked, rejected, cancelled, and error states with both text
-  and color-independent status markers.
+  and color-independent status markers, plus terminal model-verification,
+  failure-class, and workspace-quarantine facts.
+
+The progress composition is a count of published nodes or steps, not a weighted
+percentage. `Dependencies met` means only that every published prerequisite is
+Host-confirmed complete. It does not claim that the node has passed plan review,
+entered the Ready Queue, received an execution slot, or will run next. The Web
+view deliberately does not infer queue ordering, critical path, slot capacity,
+slot utilization, or an ETA from the current telemetry protocol.
 
 Distributed v1 deliberately does not guess. While a remote task is running,
 the durable ledger proves its task state, pool, node, claim generation, lease,
@@ -780,9 +795,10 @@ The ordinary adaptive master-plan contract remains linear: the Host executes
 its first pending step and each step depends on the preceding step. An
 orchestration-enabled local lane instead publishes its validated DAG and the
 Host may keep a bounded dependency-ready Worker pool filled in parallel. The
-view renders the reported `dependsOn` edges, Host-selected ready nodes, and
-active Agents for either shape; it does not invent dependencies, Workers,
-admissions, or parallelism that Host telemetry did not report.
+view renders the reported `dependsOn` edges, mechanically dependency-ready
+nodes, Host-reported running node tasks, and active Agents for either shape; it
+does not invent queue rank, slot occupancy, dependencies, Workers, admissions,
+or parallelism that Host telemetry did not report.
 
 The Host publishes bounded, session-filtered snapshots through a loopback-only
 RPC channel. The browser takes a baseline snapshot and then uses
