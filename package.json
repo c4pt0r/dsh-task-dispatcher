@@ -41,6 +41,12 @@
   "files": [
     "bundle.cordis.patch.yml",
     "dispatcher.js",
+    "dispatcher-child-runner.js",
+    "dispatcher-contracts.js",
+    "dispatcher-policy.js",
+    "dispatcher-shared.js",
+    "dispatcher-telemetry.js",
+    "dispatcher-tools.js",
     "distributed-store.js",
     "distributed-worker.js",
     "orchestration.js",
@@ -61,9 +67,9 @@
   "scripts": {
     "bundle": "tsdown",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "oxlint --deny-warnings dispatcher.js dispatcher.test.js distributed-store.js distributed-store.test.js distributed-worker.js distributed-worker.test.js orchestration.js orchestration.test.js macro-planning.js macro-planning.test.js ready-scheduler.js ready-scheduler.test.js workspace-isolation.js workspace-isolation.test.js config-proposals.js config-proposals.test.js src/client tests/client tsdown.config.ts vitest.config.ts",
+    "lint": "oxlint --deny-warnings dispatcher.js dispatcher-child-runner.js dispatcher-contracts.js dispatcher-policy.js dispatcher-shared.js dispatcher-telemetry.js dispatcher-tools.js dispatcher.test.js dispatcher-facade.test.js distributed-store.js distributed-store.test.js distributed-worker.js distributed-worker.test.js orchestration.js orchestration.test.js macro-planning.js macro-planning.test.js ready-scheduler.js ready-scheduler.test.js workspace-isolation.js workspace-isolation.test.js config-proposals.js config-proposals.test.js src/client tests/client tsdown.config.ts vitest.config.ts",
     "publint": "publint",
-    "test:host": "node --test dispatcher.test.js distributed-store.test.js distributed-worker.test.js orchestration.test.js macro-planning.test.js ready-scheduler.test.js workspace-isolation.test.js config-proposals.test.js",
+    "test:host": "node --test dispatcher.test.js dispatcher-facade.test.js distributed-store.test.js distributed-worker.test.js orchestration.test.js macro-planning.test.js ready-scheduler.test.js workspace-isolation.test.js config-proposals.test.js",
     "test:client": "npm run bundle && vitest run",
     "test": "npm run test:host && npm run test:client",
     "prepublishOnly": "npm run bundle"

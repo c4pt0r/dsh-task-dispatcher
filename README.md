@@ -197,6 +197,26 @@ and an attenuated Host grant; it does not receive sibling or future nodes.
 | Local orchestration | Contract-bearing macro DAG; optional node-local plans inside Workers | At a natural or bounded eventual quiescent checkpoint, replace only never-started nodes | Prioritized rolling backfill with bounded replan checkpoints | Process-local |
 | Distributed v1 | One worker runs the complete classic or adaptive pipeline | Inside that worker; recursive DAG is disabled | Across whole tasks/workers, not across machines within one task | Envelope, lease, cancellation, and terminal result |
 
+### Internal code boundaries
+
+`dispatcher.js` remains the compatibility facade and composition root. The
+large control-plane concerns are split behind that unchanged public entry:
+
+| Module | Responsibility |
+|---|---|
+| `dispatcher-child-runner.js` | Bounded child startup, structured-output capture, cancellation, and exact-once cleanup |
+| `dispatcher-contracts.js` | Single-source model, task-result, and tool JSON Schemas |
+| `dispatcher-policy.js` | Lane policy, cross-field validation, Settings persistence, and restart-scoped configuration RPC |
+| `dispatcher-telemetry.js` | Session projections, retention, watches, revisions, and loopback telemetry RPC |
+| `dispatcher-shared.js` | Side-effect-free guards, clipping, path containment, and contained diagnostic logging |
+| `dispatcher-tools.js` | Model-facing dispatch, durable status, and cancellation tool adapters |
+| `dispatcher.js` | Planning/execution state machines, runtime lifecycle, Cordis `apply`, and compatibility re-exports |
+
+The dependency direction is one-way: focused modules may depend on the shared
+leaf, while none imports the `dispatcher.js` facade. Package-root and
+`/dispatcher` exports are tested name-for-name and by object identity so future
+refactors cannot silently break consumers.
+
 ## What it guarantees
 
 For every `dispatch_task` call, the plugin:
