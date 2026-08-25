@@ -25,11 +25,17 @@ const PROPOSAL_TASK_KEYS = new Set([
   'title',
   'objective',
   'dependsOn',
+  'inputContracts',
+  'outputContracts',
+  'resourceClass',
+  'estimatedCost',
   'scope',
   'acceptanceCriteria',
   'covers',
 ])
 const CRITERION_KEYS = new Set(['id', 'text'])
+const INPUT_CONTRACT_KEYS = new Set(['id', 'fromNodeId', 'outputContractId', 'description'])
+const OUTPUT_CONTRACT_KEYS = new Set(['id', 'description'])
 const PROPOSAL_OPTION_KEYS = new Set([
   'policy',
   'maxNodes',
@@ -47,6 +53,9 @@ const MAX_TITLE_CHARS = 200
 const MAX_OBJECTIVE_CHARS = 4_000
 const MAX_CRITERION_CHARS = 2_000
 const MAX_CRITERIA_PER_NODE = 12
+const MAX_CONTRACTS_PER_NODE = 24
+const RESOURCE_CLASSES = new Set(['analysis', 'code', 'test', 'integration', 'review', 'operations'])
+const ESTIMATED_COSTS = new Set(['small', 'medium', 'large'])
 
 function deepFreeze(value) {
   if (value === null || typeof value !== 'object' || Object.isFrozen(value)) return value
@@ -763,6 +772,106 @@ function assertCoverage(tasks, field, required, label) {
   if (missing !== undefined) fail('COVERAGE_MISSING', `${label} does not cover required id ${JSON.stringify(missing)}`)
 }
 
+function normalizedContractDescription(value, label) {
+  return normalizedString(value, label, MAX_CRITERION_CHARS)
+}
+
+function normalizeOutputContracts(value, nodeId) {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_CONTRACTS_PER_NODE) {
+    fail(
+      'INVALID_CONTRACT',
+      `subtask proposal task ${nodeId}.outputContracts must contain 1-${MAX_CONTRACTS_PER_NODE} entries`,
+    )
+  }
+  const seen = new Set()
+  return value.map((raw, index) => {
+    exactObject(raw, OUTPUT_CONTRACT_KEYS, `subtask proposal task ${nodeId} output contract ${index}`)
+    const id = stableId(raw.id, `subtask proposal task ${nodeId} output contract ${index}.id`)
+    if (seen.has(id)) fail('DUPLICATE_ID', `subtask proposal task ${nodeId} repeats output contract ${JSON.stringify(id)}`)
+    seen.add(id)
+    return {
+      id,
+      description: normalizedContractDescription(
+        raw.description,
+        `subtask proposal task ${nodeId} output contract ${id}.description`,
+      ),
+    }
+  })
+}
+
+function normalizeInputContracts(value, nodeId) {
+  if (!Array.isArray(value) || value.length > MAX_CONTRACTS_PER_NODE) {
+    fail(
+      'INVALID_CONTRACT',
+      `subtask proposal task ${nodeId}.inputContracts must contain at most ${MAX_CONTRACTS_PER_NODE} entries`,
+    )
+  }
+  const seen = new Set()
+  const sources = new Set()
+  return value.map((raw, index) => {
+    exactObject(raw, INPUT_CONTRACT_KEYS, `subtask proposal task ${nodeId} input contract ${index}`)
+    const id = stableId(raw.id, `subtask proposal task ${nodeId} input contract ${index}.id`)
+    if (seen.has(id)) fail('DUPLICATE_ID', `subtask proposal task ${nodeId} repeats input contract ${JSON.stringify(id)}`)
+    seen.add(id)
+    const fromNodeId = stableId(
+      raw.fromNodeId,
+      `subtask proposal task ${nodeId} input contract ${id}.fromNodeId`,
+    )
+    const outputContractId = stableId(
+      raw.outputContractId,
+      `subtask proposal task ${nodeId} input contract ${id}.outputContractId`,
+    )
+    const source = `${fromNodeId}\0${outputContractId}`
+    if (sources.has(source)) {
+      fail(
+        'DUPLICATE_CONTRACT_REFERENCE',
+        `subtask proposal task ${nodeId} repeats input source ${fromNodeId}.${outputContractId}`,
+      )
+    }
+    sources.add(source)
+    return {
+      id,
+      fromNodeId,
+      outputContractId,
+      description: normalizedContractDescription(
+        raw.description,
+        `subtask proposal task ${nodeId} input contract ${id}.description`,
+      ),
+    }
+  })
+}
+
+function assertContractDependencies(tasks) {
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  for (const task of tasks) {
+    const referencedDependencies = new Set()
+    for (const input of task.inputContracts) {
+      if (!task.dependsOn.includes(input.fromNodeId)) {
+        fail(
+          'CONTRACT_NOT_DIRECT_DEPENDENCY',
+          `task ${task.id} input ${input.id} references non-direct dependency ${input.fromNodeId}`,
+        )
+      }
+      const producer = byId.get(input.fromNodeId)
+      const output = producer?.outputContracts.find(contract => contract.id === input.outputContractId)
+      if (output === undefined) {
+        fail(
+          'CONTRACT_MISSING',
+          `task ${task.id} input ${input.id} references unknown output ${input.fromNodeId}.${input.outputContractId}`,
+        )
+      }
+      referencedDependencies.add(input.fromNodeId)
+    }
+    const missing = task.dependsOn.find(id => !referencedDependencies.has(id))
+    if (missing !== undefined) {
+      fail(
+        'DEPENDENCY_CONTRACT_MISSING',
+        `task ${task.id} dependency ${missing} has no explicit input contract`,
+      )
+    }
+  }
+}
+
 function assertAcyclic(tasks) {
   const byId = new Map(tasks.map(task => [task.id, task]))
   for (const task of tasks) {
@@ -830,6 +939,14 @@ export function validateSubtaskProposal(value, options = {}) {
     const title = normalizedString(raw.title, `subtask proposal task ${id}.title`, MAX_TITLE_CHARS)
     const objective = normalizedString(raw.objective, `subtask proposal task ${id}.objective`, MAX_OBJECTIVE_CHARS)
     const dependsOn = normalizedIdList(raw.dependsOn, `subtask proposal task ${id}.dependsOn`)
+    const inputContracts = normalizeInputContracts(raw.inputContracts, id)
+    const outputContracts = normalizeOutputContracts(raw.outputContracts, id)
+    if (!RESOURCE_CLASSES.has(raw.resourceClass)) {
+      fail('INVALID_ARGUMENT', `subtask proposal task ${id}.resourceClass is unsupported`)
+    }
+    if (!ESTIMATED_COSTS.has(raw.estimatedCost)) {
+      fail('INVALID_ARGUMENT', `subtask proposal task ${id}.estimatedCost is unsupported`)
+    }
     const scope = normalizedIdList(raw.scope, `subtask proposal task ${id}.scope`, allowedScopes)
     const covers = normalizedIdList(raw.covers, `subtask proposal task ${id}.covers`, allowedCriteria)
     if (!Array.isArray(raw.acceptanceCriteria)
@@ -851,10 +968,25 @@ export function validateSubtaskProposal(value, options = {}) {
       return { id: criterionId, text }
     })
     totalText += title.length + objective.length
-    return { id, title, objective, dependsOn, scope, acceptanceCriteria, covers }
+      + inputContracts.reduce((sum, item) => sum + item.description.length, 0)
+      + outputContracts.reduce((sum, item) => sum + item.description.length, 0)
+    return {
+      id,
+      title,
+      objective,
+      dependsOn,
+      inputContracts,
+      outputContracts,
+      resourceClass: raw.resourceClass,
+      estimatedCost: raw.estimatedCost,
+      scope,
+      acceptanceCriteria,
+      covers,
+    }
   })
   if (totalText > MAX_PLAN_TEXT_CHARS) fail('SIZE_LIMIT', `subtask plan text exceeds ${MAX_PLAN_TEXT_CHARS} characters`)
   assertAcyclic(tasks)
+  assertContractDependencies(tasks)
   assertCoverage(tasks, 'scope', requiredScopeIds, 'subtask scope')
   assertCoverage(tasks, 'covers', requiredCriterionIds, 'subtask criteria')
   return deepFreeze({ summary, tasks })

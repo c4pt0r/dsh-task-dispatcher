@@ -250,6 +250,31 @@ describe('TaskDispatcherAction', () => {
     expect(within(dialog).getByText('local/deepseek-executor')).toBeTruthy()
     expect(within(dialog).getByText('telemetry-executor')).toBeTruthy()
     expect(within(dialog).getByText('agent-plan')).toBeTruthy()
+    expect(within(dialog).queryByText(zh['plan.scope.macro.title'])).toBeNull()
+    expect(within(dialog).queryByText(zh['plan.scope.node.title'])).toBeNull()
+    expect(document.querySelector('[data-plan-scope="linear"]')).toBeTruthy()
+  })
+
+  it('recognizes an unambiguously parallel macro DAG before its first child starts', () => {
+    render(<TaskDispatcherAction {...props(stateWithTasks([task({
+      taskId: 'task-root-planning',
+      title: '正在审核宏观计划',
+      phase: 'initial-plan-review',
+      workers: [task().workers[0]!],
+      masterPlan: {
+        planId: 'parallel-plan', revision: 1, patchCount: 0, status: 'active', summary: '两个独立契约节点。',
+        steps: [
+          { id: 'left', title: '左分支', objective: '', status: 'pending', attempts: 0, dependsOn: [] },
+          { id: 'right', title: '右分支', objective: '', status: 'pending', attempts: 0, dependsOn: [] },
+        ],
+      },
+    })]))} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(screen.getByText(zh['plan.scope.macro.title'])).toBeTruthy()
+    expect(screen.getByRole('list', { name: '“正在审核宏观计划”宏观 DAG 的契约节点' })).toBeTruthy()
+    expect(screen.queryByRole('region', { name: /Host Ready Queue/u })).toBeNull()
+    expect(screen.queryByText(zh['task.orchestration.workerScope'])).toBeNull()
   })
 
   it('labels recursive child tasks with their verified parent DAG node', () => {
@@ -263,6 +288,98 @@ describe('TaskDispatcherAction', () => {
     fireEvent.click(screen.getByRole('button'))
 
     expect(screen.getByText('父任务：根任务 · 节点 inspect · 深度 1')).toBeTruthy()
+    expect(screen.getByText(zh['task.orchestration.workerScope'])).toBeTruthy()
+  })
+
+  it('separates the macro DAG, node-local Worker pipelines, and continuously refilled Host Ready Queue', () => {
+    const parent = task({
+      taskId: 'task-root',
+      title: '根任务',
+      workers: [task().workers[0]!],
+      masterPlan: {
+        planId: 'macro-plan', revision: 2, patchCount: 0, status: 'active', summary: '并行检查两个契约。',
+        steps: [
+          { id: 'inspect', title: '页面检查', objective: '检查页面契约。', status: 'working', attempts: 1, dependsOn: [] },
+          { id: 'cross-check', title: '事实交叉检查', objective: '独立验证事实。', status: 'working', attempts: 1, dependsOn: [] },
+        ],
+      },
+    })
+    const inspect = task({
+      taskId: 'task-inspect',
+      title: '页面检查',
+      orchestration: { parentTaskId: 'task-root', nodeId: 'inspect', depth: 1 },
+    })
+    const crossCheck = task({
+      taskId: 'task-cross-check',
+      title: '事实交叉检查',
+      phase: 'step-verifier',
+      orchestration: { parentTaskId: 'task-root', nodeId: 'cross-check', depth: 1 },
+    })
+    render(<TaskDispatcherAction {...props(stateWithTasks([parent, inspect, crossCheck]))} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(screen.getByText(zh['plan.scope.macro.title'])).toBeTruthy()
+    expect(screen.getByText(zh['plan.scope.macro.description'])).toBeTruthy()
+    expect(screen.getAllByText(zh['plan.scope.node.title'])).toHaveLength(2)
+    expect(screen.getAllByText(zh['plan.scope.node.description'])).toHaveLength(2)
+    expect(screen.getByRole('list', { name: '“根任务”宏观 DAG 的契约节点' })).toBeTruthy()
+    expect(screen.getByRole('list', { name: '“页面检查”Worker 节点内的局部流水线' })).toBeTruthy()
+
+    const scheduler = screen.getByRole('region', {
+      name: 'Host Ready Queue 持续补位：2 个本地任务节点并发运行',
+    })
+    expect(scheduler.getAttribute('data-orchestration-active-nodes')).toBe('2')
+    expect(scheduler.getAttribute('data-orchestration-scheduling')).toBe('continuous-ready-queue')
+    const nodes = within(scheduler).getByRole('list', { name: zh['orchestration.scheduler.nodes.aria'] })
+    expect(within(nodes).getByLabelText('任务节点 inspect，页面检查，节点内阶段：执行步骤')).toBeTruthy()
+    expect(within(nodes).getByLabelText('任务节点 cross-check，事实交叉检查，节点内阶段：验收步骤')).toBeTruthy()
+    expect(within(scheduler).getByText(zh['orchestration.scheduler.hint'])).toBeTruthy()
+    expect(within(scheduler).getByText(/本地只读/u)).toBeTruthy()
+  })
+
+  it('shows a terminal Worker failure on its macro node instead of leaving it visually pending', () => {
+    const parent = task({
+      taskId: 'task-root',
+      title: '根任务',
+      masterPlan: {
+        planId: 'macro-plan', revision: 2, patchCount: 0, status: 'error', summary: '检查一个契约节点。',
+        steps: [
+          { id: 'inspect', title: '页面检查', objective: '检查页面契约。', status: 'pending', attempts: 1, dependsOn: [] },
+        ],
+      },
+    })
+    const failedChild = task({
+      taskId: 'task-inspect',
+      title: '页面检查',
+      status: 'rejected',
+      phase: 'finished',
+      orchestration: { parentTaskId: 'task-root', nodeId: 'inspect', depth: 1 },
+    })
+    render(<TaskDispatcherAction {...props(stateWithTasks([parent, failedChild]))} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    const plan = screen.getByRole('list', { name: '“根任务”宏观 DAG 的契约节点' })
+    expect(within(plan).getByText(zh['task.status.rejected'])).toBeTruthy()
+    expect(plan.querySelector('[data-step-status="rejected"]')).toBeTruthy()
+    expect(within(plan).queryByText(zh['step.status.pending'])).toBeNull()
+  })
+
+  it('renders the orchestration hierarchy labels in English', () => {
+    const parent = task({ taskId: 'task-root', title: 'Root task' })
+    const child = task({
+      taskId: 'task-child',
+      title: 'Inspect page',
+      orchestration: { parentTaskId: 'task-root', nodeId: 'inspect', depth: 1 },
+    })
+    render(<TaskDispatcherAction {...props(stateWithTasks([parent, child]), enT)} />)
+    fireEvent.click(screen.getByRole('button'))
+
+    expect(screen.getByText(en['plan.scope.macro.title'])).toBeTruthy()
+    expect(screen.getByText(en['plan.scope.node.title'])).toBeTruthy()
+    expect(screen.getByRole('region', {
+      name: 'Host Ready Queue with continuous slot refill: 1 local task node running',
+    })).toBeTruthy()
+    expect(screen.getByText(en['task.orchestration.workerScope'])).toBeTruthy()
   })
 
   it('leaves the local task card unchanged when distributed telemetry is absent', () => {

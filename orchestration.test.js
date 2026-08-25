@@ -55,16 +55,27 @@ function reserve(ledger, grantToken, taskId, children) {
 }
 
 function proposalTask(id, overrides = {}) {
-  return {
+  const task = {
     id,
     title: `Complete ${id}`,
     objective: `Complete the bounded ${id} scope and verify the result.`,
     dependsOn: [],
+    inputContracts: [],
+    outputContracts: [{ id: 'result', description: `${id} verified result.` }],
+    resourceClass: 'analysis',
+    estimatedCost: 'medium',
     scope: ['frontend'],
     acceptanceCriteria: [{ id: `${id}-ok`, text: `${id} has concrete verification evidence.` }],
     covers: ['render'],
     ...overrides,
   }
+  task.inputContracts = overrides.inputContracts ?? task.dependsOn.map(dependency => ({
+    id: `${dependency}-result`,
+    fromNodeId: dependency,
+    outputContractId: 'result',
+    description: `Verified result from ${dependency}.`,
+  }))
+  return task
 }
 
 function validProposal() {

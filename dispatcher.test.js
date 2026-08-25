@@ -78,6 +78,22 @@ function lane(overrides = {}) {
   }
 }
 
+function macroTask(value) {
+  const dependsOn = value.dependsOn ?? []
+  return {
+    inputContracts: dependsOn.map(dependency => ({
+      id: `${dependency}-result`,
+      fromNodeId: dependency,
+      outputContractId: 'result',
+      description: `Verified result produced by ${dependency}.`,
+    })),
+    outputContracts: [{ id: 'result', description: `Verified result produced by ${value.id}.` }],
+    resourceClass: 'analysis',
+    estimatedCost: 'medium',
+    ...value,
+  }
+}
+
 function config(overrides = {}) {
   return resolveDispatcherConfig({
     defaultRunInBackground: false,
@@ -170,6 +186,20 @@ function childRun(id, structured, options = {}) {
     },
   }
   return { run, disposals: () => disposals }
+}
+
+async function withinTestDeadline(promise, message, timeoutMs = 1_000) {
+  let timeout
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs)
+      }),
+    ])
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 function pipelineSpec(overrides = {}) {
@@ -1028,7 +1058,7 @@ test('orchestration patch APIs protect completed nodes and replace only a valid 
   spec.laneId = 'root'
   spec.lane = configured.lanes.root
   spec.laneCatalog = configured.lanes
-  const completed = {
+  const completed = macroTask({
     id: 'inspect',
     title: 'Inspect',
     objective: 'Inspect the artifact.',
@@ -1036,8 +1066,8 @@ test('orchestration patch APIs protect completed nodes and replace only a valid 
     scope: ['artifact'],
     acceptanceCriteria: [{ id: 'inspect-ok', text: 'Inspection has evidence.' }],
     covers: ['requirements'],
-  }
-  const pending = {
+  })
+  const pending = macroTask({
     id: 'old-followup',
     title: 'Old follow-up',
     objective: 'Check the original assumption.',
@@ -1045,7 +1075,7 @@ test('orchestration patch APIs protect completed nodes and replace only a valid 
     scope: [],
     acceptanceCriteria: [{ id: 'old-ok', text: 'Original assumption is checked.' }],
     covers: [],
-  }
+  })
   const currentTasks = [completed, pending]
   const plan = {
     planId: 'plan-task-1',
@@ -1082,7 +1112,7 @@ test('orchestration patch APIs protect completed nodes and replace only a valid 
     ],
     history: [],
   }
-  const replacement = {
+  const replacement = macroTask({
     id: 'cross-check',
     title: 'Cross-check',
     objective: 'Cross-check the accepted inspection evidence.',
@@ -1090,7 +1120,7 @@ test('orchestration patch APIs protect completed nodes and replace only a valid 
     scope: [],
     acceptanceCriteria: [{ id: 'cross-check-ok', text: 'Inspection evidence is cross-checked.' }],
     covers: [],
-  }
+  })
   const seen = new Set(['inspect', 'old-followup', 'retired'])
   const input = {
     baseRevision: 3,
@@ -4581,7 +4611,7 @@ test('Host orchestration executes a reviewed read-only DAG in parallel without e
   const proposal = {
     summary: 'Inspect the artifact and independently check the requirements.',
     tasks: [
-      {
+      macroTask({
         id: 'inspect',
         title: 'Inspect reference',
         objective: 'Read the bounded reference and report concrete evidence.',
@@ -4589,8 +4619,8 @@ test('Host orchestration executes a reviewed read-only DAG in parallel without e
         scope: ['code'],
         acceptanceCriteria: [{ id: 'inspect-ok', text: 'The reference is inspected with evidence.' }],
         covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'cross-check',
         title: 'Cross-check facts',
         objective: 'Independently cross-check the bounded requirements.',
@@ -4598,7 +4628,7 @@ test('Host orchestration executes a reviewed read-only DAG in parallel without e
         scope: [],
         acceptanceCriteria: [{ id: 'cross-check-ok', text: 'The requirements are cross-checked.' }],
         covers: ['requirements'],
-      },
+      }),
     ],
   }
   let executorStarts = 0
@@ -4667,13 +4697,468 @@ test('Host orchestration executes a reviewed read-only DAG in parallel without e
   assert.equal(labels.some(label => /dispatch_task|workflow|ralph/u.test(label)), false)
   assert.equal(SUBTASK_PLAN_OUTPUT_SCHEMA.additionalProperties, false)
   assert.equal(SUBTASK_PLAN_OUTPUT_SCHEMA.properties.tasks.items.additionalProperties, false)
-  assert.match(buildSubtaskPlannerPrompt(spec), /rawRecursiveToolsAvailable": false/u)
+  const macroPrompt = buildSubtaskPlannerPrompt(spec)
+  assert.match(macroPrompt, /rawRecursiveToolsAvailable": false/u)
+  assert.match(macroPrompt, /complete coarse-grained semantic DAG/u)
+  assert.match(macroPrompt, /Maximize safe parallelism/u)
+  assert.match(macroPrompt, /do not plan implementation details inside a node/u)
   const recursiveTasks = telemetry.snapshot(spec.parent.id).tasks
     .filter(task => task.orchestration !== undefined)
   assert.equal(recursiveTasks.length, 2)
   assert.deepEqual(recursiveTasks.map(task => task.orchestration.nodeId).sort(), ['cross-check', 'inspect'])
   assert.ok(recursiveTasks.every(task => task.orchestration.parentTaskId === spec.taskId))
   assert.ok(recursiveTasks.every(task => task.orchestration.depth === 1))
+})
+
+test('Host scheduler prioritizes the longest macro critical path instead of planner array order', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 0,
+        orchestration: {
+          enabled: true,
+          childLane: 'child',
+          maxDepth: 1,
+          maxTaskNodes: 4,
+          maxChildrenPerNode: 3,
+          maxConcurrentNodes: 1,
+          maxTotalModelRuns: 9,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root,
+    laneId: 'root',
+    title: 'Critical path root',
+    deliverables: [],
+  })
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Start the prerequisite that unlocks the expensive validation before unrelated work.',
+    tasks: [
+      macroTask({
+        id: 'unrelated', title: 'Unrelated check', objective: 'Check an independent bounded fact.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'medium',
+        acceptanceCriteria: [{ id: 'unrelated-ok', text: 'The independent fact is checked.' }],
+      }),
+      macroTask({
+        id: 'scout', title: 'Scout prerequisite', objective: 'Produce the prerequisite evidence.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'small',
+        acceptanceCriteria: [{ id: 'scout-ok', text: 'Prerequisite evidence exists.' }],
+      }),
+      macroTask({
+        id: 'validate', title: 'Validate prerequisite', objective: 'Validate the prerequisite result.',
+        dependsOn: ['scout'], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'validate-ok', text: 'Prerequisite evidence is validated.' }],
+      }),
+    ],
+  }
+  const executorOrder = []
+  let sequence = 0
+  const immediate = structured => childRun(`critical-${++sequence}`, structured).run
+  const criterionByTitle = new Map([
+    ['Scout prerequisite', 'scout-ok'],
+    ['Validate prerequisite', 'validate-ok'],
+    ['Unrelated check', 'unrelated-ok'],
+  ])
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        if (request.label === 'Critical path root / orchestration planner') return immediate(proposal)
+        if (request.label === 'Critical path root / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Critical path root / orchestration final verifier') return immediate(verifierReport())
+        const match = /^(Scout prerequisite|Validate prerequisite|Unrelated check) \/ (executor|verifier) 1$/u.exec(request.label)
+        if (match === null) throw new Error(`unexpected child label ${request.label}`)
+        const criterionId = criterionByTitle.get(match[1])
+        if (match[2] === 'verifier') return immediate(verifierReport(['requirements', criterionId]))
+        executorOrder.push(match[1])
+        return immediate(executorReport({
+          artifacts: [],
+          criteria: [
+            { id: 'requirements', status: 'pass', evidence: 'Root requirement checked.' },
+            { id: criterionId, status: 'pass', evidence: `${criterionId} evidence.` },
+          ],
+        }))
+      },
+    },
+  }
+
+  const result = await runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  assert.equal(result.status, 'accepted')
+  assert.deepEqual(executorOrder, ['Scout prerequisite', 'Validate prerequisite', 'Unrelated check'])
+})
+
+test('Host ready queue backfills an unlocked successor before an unrelated slow Worker settles', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 0,
+        orchestration: {
+          enabled: true, childLane: 'child', maxDepth: 1, maxTaskNodes: 4,
+          maxChildrenPerNode: 3, maxConcurrentNodes: 2, maxTotalModelRuns: 9,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({ lane: configured.lanes.root, laneId: 'root', title: 'Rolling ready queue', deliverables: [] })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Run an independent slow check while the critical chain keeps moving.',
+    tasks: [
+      macroTask({
+        id: 'slow', title: 'Slow independent', objective: 'Inspect the independent slow fact.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'small',
+        acceptanceCriteria: [{ id: 'slow-ok', text: 'The slow fact is inspected.' }],
+      }),
+      macroTask({
+        id: 'source', title: 'Fast source', objective: 'Produce the critical source evidence.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'medium',
+        acceptanceCriteria: [{ id: 'source-ok', text: 'Critical source evidence exists.' }],
+      }),
+      macroTask({
+        id: 'successor', title: 'Fast successor', objective: 'Consume and verify the source evidence.',
+        dependsOn: ['source'], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'successor-ok', text: 'Source evidence is consumed.' }],
+      }),
+    ],
+  }
+  let sequence = 0
+  let releaseSlow
+  let slowReleased = false
+  const slowGate = new Promise(resolve => { releaseSlow = resolve })
+  let notifySuccessor
+  const successorStarted = new Promise(resolve => { notifySuccessor = resolve })
+  const immediate = structured => childRun(`rolling-${++sequence}`, structured).run
+  const reportFor = criterionId => executorReport({
+    artifacts: [],
+    criteria: [
+      { id: 'requirements', status: 'pass', evidence: 'Root requirement checked.' },
+      { id: criterionId, status: 'pass', evidence: `${criterionId} evidence.` },
+    ],
+  })
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        if (request.label === 'Rolling ready queue / orchestration planner') return immediate(proposal)
+        if (request.label === 'Rolling ready queue / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Rolling ready queue / orchestration final verifier') return immediate(verifierReport())
+        if (request.label === 'Slow independent / executor 1') {
+          return childRun(`rolling-${++sequence}`, undefined, {
+            result: slowGate.then(() => ({
+              output: [],
+              structured: reportFor('slow-ok'),
+              stopReason: 'completed',
+            })),
+          }).run
+        }
+        if (request.label === 'Fast source / executor 1') return immediate(reportFor('source-ok'))
+        if (request.label === 'Fast successor / executor 1') {
+          assert.equal(slowReleased, false)
+          notifySuccessor()
+          return immediate(reportFor('successor-ok'))
+        }
+        if (request.label === 'Slow independent / verifier 1') return immediate(verifierReport(['requirements', 'slow-ok']))
+        if (request.label === 'Fast source / verifier 1') return immediate(verifierReport(['requirements', 'source-ok']))
+        if (request.label === 'Fast successor / verifier 1') return immediate(verifierReport(['requirements', 'successor-ok']))
+        throw new Error(`unexpected rolling scheduler label ${request.label}`)
+      },
+    },
+  }
+
+  const runningTask = runTaskPipeline(ctx, spec, undefined, ctx.logger)
+  let timeout
+  let waitError
+  try {
+    await Promise.race([
+      successorStarted,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('successor was not backfilled')), 1_000)
+      }),
+    ])
+  } catch (error) {
+    waitError = error
+  } finally {
+    clearTimeout(timeout)
+    slowReleased = true
+    releaseSlow()
+  }
+  const result = await runningTask
+  if (waitError !== undefined) throw waitError
+  assert.equal(result.status, 'accepted')
+})
+
+test('Host scheduler drains and disposes a slow sibling before publishing an evidence-limit error', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 0,
+        orchestration: {
+          enabled: true, childLane: 'child', maxDepth: 1, maxTaskNodes: 3,
+          maxChildrenPerNode: 2, maxConcurrentNodes: 2, maxTotalModelRuns: 7,
+          maxResultBytes: 4_096,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root, laneId: 'root', title: 'Evidence overflow drain', deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const fastCriteria = Array.from({ length: 5 }, (_, index) => ({
+    id: `fast-${index + 1}`,
+    text: `Fast evidence criterion ${index + 1} is independently verified.`,
+  }))
+  const fastCriterionIds = ['requirements', ...fastCriteria.map(item => item.id)]
+  const proposal = {
+    summary: 'Collect oversized accepted evidence while an unrelated Worker remains active.',
+    tasks: [
+      macroTask({
+        id: 'fast', title: 'Fast oversized evidence', objective: 'Return collectively oversized evidence.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: fastCriteria,
+      }),
+      macroTask({
+        id: 'slow', title: 'Slow sibling', objective: 'Wait until the Host cancels this independent Worker.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'small',
+        acceptanceCriteria: [{ id: 'slow-ok', text: 'The slow sibling completes.' }],
+      }),
+    ],
+  }
+  let sequence = 0
+  let slowLive = false
+  let slowDisposals = 0
+  let notifySlowStarted
+  const slowStarted = new Promise(resolve => { notifySlowStarted = resolve })
+  const labels = []
+  const immediate = structured => childRun(`overflow-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        if (request.label === 'Evidence overflow drain / orchestration planner') return immediate(proposal)
+        if (request.label === 'Evidence overflow drain / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Fast oversized evidence / executor 1') {
+          return immediate(executorReport({
+            artifacts: [],
+            criteria: fastCriterionIds.map(id => ({ id, status: 'pass', evidence: `${id} executor evidence.` })),
+          }))
+        }
+        if (request.label === 'Fast oversized evidence / verifier 1') {
+          return immediate(verifierReport(fastCriterionIds, {
+            criteria: fastCriterionIds.map(id => ({
+              id,
+              status: 'pass',
+              evidence: `${id}: ${'x'.repeat(1_100)}`,
+            })),
+          }))
+        }
+        if (request.label === 'Slow sibling / executor 1') {
+          slowLive = true
+          notifySlowStarted()
+          return {
+            id: `overflow-${++sequence}`,
+            result: new Promise(() => {}),
+            dispose() {
+              slowDisposals += 1
+              slowLive = false
+            },
+          }
+        }
+        throw new Error(`unexpected overflow-drain label ${request.label}`)
+      },
+    },
+  }
+
+  const safety = new AbortController()
+  const safetyTimeout = setTimeout(() => safety.abort('overflow drain test timeout'), 1_000)
+  let result
+  try {
+    const runningTask = runTaskPipeline(ctx, spec, safety.signal, ctx.logger)
+    await withinTestDeadline(slowStarted, 'slow sibling did not start')
+    result = await withinTestDeadline(runningTask, 'Host did not drain the slow sibling')
+  } finally {
+    clearTimeout(safetyTimeout)
+    safety.abort('overflow drain test cleanup')
+  }
+  assert.equal(result.status, 'error')
+  assert.match(result.message, /exceeds 4096 bytes/u)
+  assert.equal(labels.some(label => label.includes('orchestration final verifier')), false)
+  assert.equal(result.masterPlan.steps.find(step => step.id === 'fast').status, 'pending')
+  assert.equal(result.masterPlan.history.some(event => (
+    event.kind === 'step_completed' && event.stepId === 'fast'
+  )), false)
+  assert.equal(slowDisposals, 1)
+  assert.equal(slowLive, false)
+})
+
+test('rolling admission reaches a bounded replan checkpoint instead of starving dynamic patches', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 2,
+        orchestration: {
+          enabled: true, childLane: 'child', maxDepth: 1, maxTaskNodes: 5,
+          maxChildrenPerNode: 4, maxConcurrentNodes: 2, maxTotalModelRuns: 13,
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root, laneId: 'root', title: 'Bounded rolling checkpoint', deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Backfill one critical successor, then drain to a safe macro-plan checkpoint.',
+    tasks: [
+      macroTask({
+        id: 'long', title: 'Long sibling', objective: 'Run an unrelated long inspection.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'small',
+        acceptanceCriteria: [{ id: 'long-ok', text: 'The long inspection completes.' }],
+      }),
+      macroTask({
+        id: 'source', title: 'Checkpoint source', objective: 'Produce the critical source evidence.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'source-ok', text: 'The source evidence exists.' }],
+      }),
+      macroTask({
+        id: 'middle', title: 'Checkpoint middle', objective: 'Consume the source evidence.',
+        dependsOn: ['source'], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'middle-ok', text: 'The source evidence is consumed.' }],
+      }),
+      macroTask({
+        id: 'future', title: 'Future node', objective: 'Finish after the bounded replan checkpoint.',
+        dependsOn: ['middle'], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'future-ok', text: 'The future node completes.' }],
+      }),
+    ],
+  }
+  const labels = []
+  let sequence = 0
+  let releaseLong
+  const longGate = new Promise(resolve => { releaseLong = resolve })
+  let notifyMiddleDisposed
+  const middleDisposed = new Promise(resolve => { notifyMiddleDisposed = resolve })
+  const immediate = structured => childRun(`checkpoint-${++sequence}`, structured).run
+  const criteriaFor = (title) => {
+    if (title.startsWith('Long sibling')) return ['requirements', 'long-ok']
+    if (title.startsWith('Checkpoint source')) return ['requirements', 'source-ok']
+    if (title.startsWith('Checkpoint middle')) return ['requirements', 'middle-ok']
+    return ['requirements', 'future-ok']
+  }
+  const reportFor = title => executorReport({
+    artifacts: [],
+    criteria: criteriaFor(title).map(id => ({ id, status: 'pass', evidence: `${id} evidence.` })),
+  })
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        labels.push(request.label)
+        if (request.label === 'Bounded rolling checkpoint / orchestration planner') return immediate(proposal)
+        if (request.label === 'Bounded rolling checkpoint / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Bounded rolling checkpoint / orchestration replanner 2') {
+          const match = /baseRevision must equal (\d+)/u.exec(request.prompt[0].text)
+          assert.notEqual(match, null)
+          return immediate({
+            baseRevision: Number(match[1]),
+            action: 'keep',
+            rationale: 'The remaining future node is still correct.',
+            tasks: [],
+          })
+        }
+        if (request.label === 'Bounded rolling checkpoint / orchestration final verifier') {
+          return immediate(verifierReport())
+        }
+        if (request.label === 'Long sibling / executor 1') {
+          return childRun(`checkpoint-${++sequence}`, undefined, {
+            result: longGate.then(() => ({
+              output: [],
+              structured: reportFor('Long sibling'),
+              stopReason: 'completed',
+            })),
+          }).run
+        }
+        if (request.label.endsWith('/ executor 1')) return immediate(reportFor(request.label))
+        if (request.label === 'Checkpoint middle / verifier 1') {
+          return {
+            id: `checkpoint-${++sequence}`,
+            result: Promise.resolve({
+              output: [],
+              structured: verifierReport(criteriaFor(request.label)),
+              stopReason: 'completed',
+            }),
+            dispose() { notifyMiddleDisposed() },
+          }
+        }
+        if (request.label.endsWith('/ verifier 1')) return immediate(verifierReport(criteriaFor(request.label)))
+        throw new Error(`unexpected checkpoint label ${request.label}`)
+      },
+    },
+  }
+
+  const safety = new AbortController()
+  const safetyTimeout = setTimeout(() => safety.abort('checkpoint test timeout'), 1_000)
+  const runningTask = runTaskPipeline(ctx, spec, safety.signal, ctx.logger)
+  let result
+  try {
+    await withinTestDeadline(middleDisposed, 'rolling scheduler never backfilled the middle node')
+    await Promise.resolve()
+    assert.equal(labels.includes('Future node / executor 1'), false)
+    assert.equal(labels.includes('Bounded rolling checkpoint / orchestration replanner 2'), false)
+    releaseLong()
+    result = await withinTestDeadline(runningTask, 'checkpoint orchestration did not finish')
+  } finally {
+    clearTimeout(safetyTimeout)
+    releaseLong()
+    safety.abort('checkpoint test cleanup')
+    await withinTestDeadline(runningTask, 'checkpoint cleanup did not settle').catch(() => {})
+  }
+  assert.equal(result.status, 'accepted')
+  const longVerifier = labels.indexOf('Long sibling / verifier 1')
+  const replanner = labels.indexOf('Bounded rolling checkpoint / orchestration replanner 2')
+  const future = labels.indexOf('Future node / executor 1')
+  assert.ok(longVerifier >= 0 && longVerifier < replanner)
+  assert.ok(replanner < future)
+  assert.equal(result.masterPlan.patchCount, 0)
 })
 
 test('Host orchestration dynamically replaces only the pending DAG after a settled wave', async () => {
@@ -4710,6 +5195,7 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
     lane: configured.lanes.root,
     laneId: 'root',
     title: 'Adaptive orchestration root',
+    context: 'ROOT-ONLY IMPLEMENTATION DETAIL MUST NOT LEAK TO A NODE WORKER.',
     deliverables: [{ id: 'artifact', description: 'A bounded inspected artifact.' }],
   })
   spec.laneId = 'root'
@@ -4719,7 +5205,7 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
   const initial = {
     summary: 'Probe the artifact, then follow up using the observed evidence.',
     tasks: [
-      {
+      macroTask({
         id: 'probe',
         title: 'Probe evidence',
         objective: 'Inspect the artifact and establish concrete evidence.',
@@ -4727,8 +5213,8 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
         scope: ['artifact'],
         acceptanceCriteria: [{ id: 'probe-ok', text: 'The probe records concrete evidence.' }],
         covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'old-followup',
         title: 'Old follow-up',
         objective: 'Use the original follow-up assumption.',
@@ -4736,14 +5222,14 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
         scope: ['artifact'],
         acceptanceCriteria: [{ id: 'old-ok', text: 'The original follow-up is checked.' }],
         covers: ['requirements'],
-      },
+      }),
     ],
   }
   const patch = {
     baseRevision: 3,
     action: 'replace_pending',
     rationale: 'Probe evidence makes a narrower cross-check more useful.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'evidence-cross-check',
       title: 'Evidence cross-check',
       objective: 'Cross-check the concrete probe evidence without changing the artifact.',
@@ -4751,9 +5237,10 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
       scope: ['artifact'],
       acceptanceCriteria: [{ id: 'cross-check-ok', text: 'Probe evidence is independently cross-checked.' }],
       covers: ['requirements'],
-    }],
+    })],
   }
   const labels = []
+  let crossCheckExecutorPrompt = ''
   let sequence = 0
   const immediate = structured => childRun(`dynamic-${++sequence}`, structured).run
   const ctx = {
@@ -4769,7 +5256,10 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
           case 'Adaptive orchestration root / orchestration final verifier': return immediate(verifierReport())
           case 'Probe evidence / executor 1':
             return immediate(executorReport({
-              artifacts: [],
+              artifacts: [{
+                path: 'private/producer-only.txt',
+                description: 'Untyped producer artifact that is not bound to the requested output contract.',
+              }],
               criteria: [
                 { id: 'requirements', status: 'pass', evidence: 'Root requirement inspected.' },
                 { id: 'probe-ok', status: 'pass', evidence: 'Probe evidence recorded.' },
@@ -4778,6 +5268,7 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
           case 'Probe evidence / verifier 1':
             return immediate(verifierReport(['requirements', 'probe-ok']))
           case 'Evidence cross-check / executor 1':
+            crossCheckExecutorPrompt = request.prompt[0].text
             return immediate(executorReport({
               artifacts: [],
               criteria: [
@@ -4813,6 +5304,15 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
     order: ['evidence-cross-check'],
   })
   assert.equal(labels.some(label => label.startsWith('Old follow-up /')), false)
+  assert.ok(crossCheckExecutorPrompt.includes('\\"planningLevel\\": \\"node-local\\"'))
+  assert.ok(crossCheckExecutorPrompt.includes('\\"masterPlanVisible\\": false'))
+  assert.ok(crossCheckExecutorPrompt.includes('\\"inputContractId\\": \\"probe-result\\"'))
+  assert.ok(crossCheckExecutorPrompt.includes('\\"producerNodeId\\": \\"probe\\"'))
+  assert.match(crossCheckExecutorPrompt, /evidenceDigest\\": \\"[a-f0-9]{64}/u)
+  assert.doesNotMatch(crossCheckExecutorPrompt, /private\/producer-only\.txt/u)
+  assert.doesNotMatch(crossCheckExecutorPrompt, /ROOT-ONLY IMPLEMENTATION DETAIL/u)
+  assert.doesNotMatch(crossCheckExecutorPrompt, /Adaptive orchestration root/u)
+  assert.doesNotMatch(crossCheckExecutorPrompt, /old-followup/u)
   assert.ok(labels.indexOf('Probe evidence / verifier 1')
     < labels.indexOf('Adaptive orchestration root / orchestration replanner 2'))
   const root = telemetry.snapshot(spec.parent.id).tasks.find(task => task.taskId === spec.taskId)
@@ -4855,19 +5355,19 @@ test('orchestration replans only after every parallel child in the wave has clea
   const proposal = {
     summary: 'Inspect two sources before combining them.',
     tasks: [
-      {
+      macroTask({
         id: 'source-a', title: 'Source A', objective: 'Inspect source A.', dependsOn: [], scope: [],
         acceptanceCriteria: [{ id: 'source-a-ok', text: 'Source A is inspected.' }], covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'source-b', title: 'Source B', objective: 'Inspect source B.', dependsOn: [], scope: [],
         acceptanceCriteria: [{ id: 'source-b-ok', text: 'Source B is inspected.' }], covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'combine', title: 'Combine evidence', objective: 'Combine both sources.',
         dependsOn: ['source-a', 'source-b'], scope: [],
         acceptanceCriteria: [{ id: 'combine-ok', text: 'Both sources are combined.' }], covers: ['requirements'],
-      },
+      }),
     ],
   }
   const keep = {
@@ -4978,30 +5478,30 @@ test('collect mode cannot erase an earlier quarantined child through a later suc
   const proposal = {
     summary: 'Collect one failed branch while independent verified work continues.',
     tasks: [
-      {
+      macroTask({
         id: 'unsafe', title: 'Unsafe cleanup', objective: 'Inspect work whose cleanup ownership is lost.',
         dependsOn: [], scope: [],
         acceptanceCriteria: [{ id: 'unsafe-ok', text: 'Unsafe work is inspected.' }],
         covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'source', title: 'Safe source', objective: 'Inspect the independent safe source.',
         dependsOn: [], scope: [],
         acceptanceCriteria: [{ id: 'source-ok', text: 'Safe source is inspected.' }],
         covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'check', title: 'Safe check', objective: 'Check the safe source evidence.',
         dependsOn: ['source'], scope: [],
         acceptanceCriteria: [{ id: 'check-ok', text: 'Safe source evidence is checked.' }],
         covers: ['requirements'],
-      },
-      {
+      }),
+      macroTask({
         id: 'finish', title: 'Safe finish', objective: 'Finish the independent safe chain.',
         dependsOn: ['check'], scope: [],
         acceptanceCriteria: [{ id: 'finish-ok', text: 'Safe chain is complete.' }],
         covers: ['requirements'],
-      },
+      }),
     ],
   }
   const labels = []
@@ -5059,6 +5559,105 @@ test('collect mode cannot erase an earlier quarantined child through a later suc
   ])
 })
 
+test('cancellation preserves an earlier collect-mode quarantine while draining an independent Worker', async () => {
+  const childLane = lane({
+    executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
+    planner: undefined, maxAttempts: 1, retryOnRevise: false,
+  })
+  const configured = resolveDispatcherConfig({
+    lanes: {
+      child: childLane,
+      root: lane({
+        executorTools: ['read'], plannerTools: ['read'], verifierTools: ['read'],
+        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        maxPlanPatches: 0,
+        orchestration: {
+          enabled: true, childLane: 'child', maxDepth: 1, maxTaskNodes: 3,
+          maxChildrenPerNode: 2, maxConcurrentNodes: 1, maxTotalModelRuns: 7,
+          failureMode: 'collect',
+        },
+      }),
+    },
+  })
+  const spec = pipelineSpec({
+    lane: configured.lanes.root, laneId: 'root', title: 'Sticky quarantine cancellation', deliverables: [],
+  })
+  spec.laneId = 'root'
+  spec.lane = configured.lanes.root
+  spec.laneCatalog = configured.lanes
+  const proposal = {
+    summary: 'Record one quarantined terminal node before an independent Worker is cancelled.',
+    tasks: [
+      macroTask({
+        id: 'unsafe', title: 'Unsafe cleanup first', objective: 'Lose cleanup ownership before collection continues.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'large',
+        acceptanceCriteria: [{ id: 'unsafe-ok', text: 'Unsafe cleanup is inspected.' }],
+      }),
+      macroTask({
+        id: 'independent', title: 'Independent running', objective: 'Remain active until root cancellation.',
+        dependsOn: [], scope: [], covers: ['requirements'], estimatedCost: 'small',
+        acceptanceCriteria: [{ id: 'independent-ok', text: 'Independent work completes.' }],
+      }),
+    ],
+  }
+  let sequence = 0
+  let independentLive = false
+  let independentDisposals = 0
+  let notifyIndependentStarted
+  const independentStarted = new Promise(resolve => { notifyIndependentStarted = resolve })
+  const immediate = structured => childRun(`sticky-cancel-${++sequence}`, structured).run
+  const ctx = {
+    logger: { warn() {} },
+    subagents: {
+      start(_transport, request) {
+        if (request.label === 'Sticky quarantine cancellation / orchestration planner') return immediate(proposal)
+        if (request.label === 'Sticky quarantine cancellation / orchestration plan review') return immediate(planReviewReport())
+        if (request.label === 'Unsafe cleanup first / executor 1') {
+          return childRun(`sticky-cancel-${++sequence}`, executorReport({
+            artifacts: [],
+            criteria: [
+              { id: 'requirements', status: 'pass', evidence: 'Requirement inspected.' },
+              { id: 'unsafe-ok', status: 'pass', evidence: 'Unsafe cleanup inspected.' },
+            ],
+          }), { disposeError: new Error('cleanup ownership lost') }).run
+        }
+        if (request.label === 'Independent running / executor 1') {
+          independentLive = true
+          notifyIndependentStarted()
+          return {
+            id: `sticky-cancel-${++sequence}`,
+            result: new Promise(() => {}),
+            dispose() {
+              independentDisposals += 1
+              independentLive = false
+            },
+          }
+        }
+        throw new Error(`unexpected sticky-cancellation label ${request.label}`)
+      },
+    },
+  }
+
+  const cancellation = new AbortController()
+  const safetyTimeout = setTimeout(() => cancellation.abort('sticky cancellation test timeout'), 1_000)
+  const runningTask = runTaskPipeline(ctx, spec, cancellation.signal, ctx.logger)
+  let result
+  try {
+    await withinTestDeadline(independentStarted, 'independent Worker did not start after quarantine')
+    cancellation.abort('cancel after quarantined terminal')
+    result = await withinTestDeadline(runningTask, 'cancelled orchestration did not drain')
+  } finally {
+    clearTimeout(safetyTimeout)
+    cancellation.abort('sticky cancellation test cleanup')
+    await withinTestDeadline(runningTask, 'sticky cancellation cleanup did not settle').catch(() => {})
+  }
+  assert.equal(result.status, 'cancelled')
+  assert.equal(result.workspaceQuarantined, true)
+  assert.equal(result.failureClass, 'infrastructure')
+  assert.equal(independentDisposals, 1)
+  assert.equal(independentLive, false)
+})
+
 test('orchestration preserves the mandatory DAG when no optional replan credits remain', async () => {
   const childLane = lane({
     executorTools: ['read'], plannerTools: [], verifierTools: ['read'],
@@ -5089,7 +5688,7 @@ test('orchestration preserves the mandatory DAG when no optional replan credits 
   spec.laneCatalog = configured.lanes
   const proposal = {
     summary: 'Run the exact two-node mandatory chain.',
-    tasks: ['first', 'second'].map((id, index) => ({
+    tasks: ['first', 'second'].map((id, index) => macroTask({
       id,
       title: index === 0 ? 'First node' : 'Second node',
       objective: `Inspect the ${id} bounded fact.`,
@@ -5174,40 +5773,40 @@ test('a suspended nested orchestrator safely resumes to patch its own pending pl
   spec.laneCatalog = configured.lanes
   const rootProposal = {
     summary: 'Join one recursively planned branch.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'branch', title: 'Branch node', objective: 'Run and verify the adaptive branch.',
       dependsOn: [], scope: [],
       acceptanceCriteria: [{ id: 'branch-ok', text: 'The adaptive branch is verified.' }],
       covers: ['requirements'],
-    }],
+    })],
   }
   const branchProposal = {
     summary: 'Inspect once, then adapt the remaining check.',
     tasks: [
-      {
+      macroTask({
         id: 'inspect', title: 'Nested inspect', objective: 'Inspect the bounded evidence.',
         dependsOn: [], scope: [],
         acceptanceCriteria: [{ id: 'inspect-ok', text: 'Nested evidence is inspected.' }],
         covers: ['requirements', 'branch-ok'],
-      },
-      {
+      }),
+      macroTask({
         id: 'old-check', title: 'Old nested check', objective: 'Use the original nested check.',
         dependsOn: ['inspect'], scope: [],
         acceptanceCriteria: [{ id: 'old-check-ok', text: 'Original nested check is complete.' }],
         covers: ['requirements', 'branch-ok'],
-      },
+      }),
     ],
   }
   const patch = {
     baseRevision: 3,
     action: 'replace_pending',
     rationale: 'Use a fresh check derived from the inspection evidence.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'fresh-check', title: 'Fresh nested check', objective: 'Cross-check the inspected evidence.',
       dependsOn: ['inspect'], scope: [],
       acceptanceCriteria: [{ id: 'fresh-check-ok', text: 'Inspected evidence is cross-checked.' }],
       covers: ['requirements', 'branch-ok'],
-    }],
+    })],
   }
   const labels = []
   let sequence = 0
@@ -5301,7 +5900,7 @@ test('Host orchestration recursively joins depth-two work with one shared slot a
 
   const rootProposal = {
     summary: 'Delegate one bounded branch.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'inspect',
       title: 'Nested branch',
       objective: 'Delegate and join one bounded leaf inspection.',
@@ -5309,11 +5908,11 @@ test('Host orchestration recursively joins depth-two work with one shared slot a
       scope: [],
       acceptanceCriteria: [{ id: 'branch-ok', text: 'The nested branch is independently verified.' }],
       covers: ['requirements'],
-    }],
+    })],
   }
   const branchProposal = {
     summary: 'Run one leaf inspection.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'inspect',
       title: 'Leaf inspection',
       objective: 'Inspect the bounded requirement and return evidence.',
@@ -5321,7 +5920,7 @@ test('Host orchestration recursively joins depth-two work with one shared slot a
       scope: [],
       acceptanceCriteria: [{ id: 'leaf-ok', text: 'The bounded leaf inspection has evidence.' }],
       covers: ['requirements', 'branch-ok'],
-    }],
+    })],
   }
   let sequence = 0
   let branchPlannerPrompt = ''
@@ -5425,7 +6024,7 @@ function singleLeafOrchestrationFixture(orchestrationOverrides = {}) {
   spec.laneCatalog = configured.lanes
   const proposal = {
     summary: 'Run one bounded verified leaf.',
-    tasks: [{
+    tasks: [macroTask({
       id: 'leaf',
       title: 'Verified leaf',
       objective: 'Inspect the bounded requirement and return evidence.',
@@ -5433,7 +6032,7 @@ function singleLeafOrchestrationFixture(orchestrationOverrides = {}) {
       scope: [],
       acceptanceCriteria: [{ id: 'leaf-ok', text: 'The leaf has concrete evidence.' }],
       covers: ['requirements'],
-    }],
+    })],
   }
   return { spec, proposal }
 }
@@ -5627,7 +6226,7 @@ test('two recursive parents share FIFO admission without false concurrency failu
 
   const rootProposal = {
     summary: 'Run two independently joined recursive branches.',
-    tasks: ['a', 'b'].map(id => ({
+    tasks: ['a', 'b'].map(id => macroTask({
       id: `branch-${id}`,
       title: `Branch ${id.toUpperCase()}`,
       objective: `Join the bounded ${id.toUpperCase()} branch.`,
@@ -5639,7 +6238,7 @@ test('two recursive parents share FIFO admission without false concurrency failu
   }
   const branchProposal = id => ({
     summary: `Run the two ${id.toUpperCase()} leaves.`,
-    tasks: ['one', 'two'].map(suffix => ({
+    tasks: ['one', 'two'].map(suffix => macroTask({
       id: `${id}-${suffix}`,
       title: `${id.toUpperCase()} leaf ${suffix}`,
       objective: `Inspect the bounded ${id.toUpperCase()} ${suffix} evidence.`,
@@ -5770,7 +6369,7 @@ test('planned orchestration children see only the step budget their attenuated g
   spec.laneCatalog = configured.lanes
   const rootProposal = {
     summary: 'Run two planned children within exact grants.',
-    tasks: ['a', 'b'].map(id => ({
+    tasks: ['a', 'b'].map(id => macroTask({
       id: `child-${id}`,
       title: `Budgeted child ${id.toUpperCase()}`,
       objective: `Complete the bounded ${id.toUpperCase()} inspection.`,
@@ -5805,6 +6404,8 @@ test('planned orchestration children see only the step budget their attenuated g
         if (phase === 'initial planner') {
           childPlannerPrompts += 1
           assert.match(request.prompt[0].text, /Use 1-1 steps/u)
+          assert.match(request.prompt[0].text, /NODE-LOCAL WORKER PLANNER/u)
+          assert.match(request.prompt[0].text, /Do not infer sibling work/u)
           return immediate(childPlan(id))
         }
         if (phase === 'initial plan review') return immediate(planReviewReport())

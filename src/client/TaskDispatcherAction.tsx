@@ -40,6 +40,7 @@ export type TaskDispatcherActionProps =
   & InjectFace<TaskDispatcherInjected>
 
 type Translate = TaskDispatcherActionProps['t']
+type PlanScope = 'linear' | 'macro' | 'node-local'
 
 const TASK_STATUS_KEYS = {
   running: 'task.status.running',
@@ -146,6 +147,30 @@ function workerDot(status: DispatcherWorkerStatus): StateDotState {
 
 function workerIsRunning(worker: DispatcherWorker): boolean {
   return worker.status === 'starting' || worker.status === 'running'
+}
+
+function taskPhaseLabel(task: DispatcherTask, t: Translate): string {
+  return task.distribution?.state === 'running' && task.workers.length === 0
+    ? t('distribution.phase.unreported')
+    : t(PHASE_KEYS[task.phase])
+}
+
+function isStrictlyLinearPlan(plan: DispatcherMasterPlan): boolean {
+  return plan.steps.every((step, index, steps) => {
+    if (index === 0) return step.dependsOn.length === 0
+    return step.dependsOn.length === 1 && step.dependsOn[0] === steps[index - 1]?.id
+  })
+}
+
+function planScope(task: DispatcherTask, childTasks: readonly DispatcherTask[]): PlanScope {
+  if (childTasks.length > 0) return 'macro'
+  if (task.orchestration !== undefined) return 'node-local'
+  // The ordinary adaptive pipeline is strictly linear. A non-linear published
+  // plan is therefore safe to identify as a macro DAG before its first child
+  // telemetry record exists. Linear and single-node plans remain deliberately
+  // unclassified because the current wire cannot distinguish their origin.
+  if (task.masterPlan !== undefined && !isStrictlyLinearPlan(task.masterPlan)) return 'macro'
+  return 'linear'
 }
 
 /** Aggregate plan progress and active child Agents for the supplied tasks. */
@@ -376,12 +401,77 @@ function WorkerList({ label, scope, workers, t }: {
   )
 }
 
-function StepRow({ dependencyLabels, step, workers, t }: {
+function ScheduledNode({ task, t }: {
+  readonly task: DispatcherTask
+  readonly t: Translate
+}) {
+  const relation = task.orchestration
+  if (relation === undefined) return null
+  const phase = taskPhaseLabel(task, t)
+  return (
+    <li
+      className={css.scheduledNode}
+      aria-label={t('orchestration.scheduler.node.aria', {
+        node: relation.nodeId,
+        title: task.title,
+        phase,
+      })}
+    >
+      <code title={relation.nodeId}>{relation.nodeId}</code>
+      <span title={task.title}>{task.title}</span>
+      <span>{phase}</span>
+    </li>
+  )
+}
+
+function HostSchedulerSummary({ childTasks, t }: {
+  readonly childTasks: readonly DispatcherTask[]
+  readonly t: Translate
+}) {
+  const runningNodes = childTasks.filter(task => task.status === 'running')
+  if (runningNodes.length === 0) return null
+  const countKey = runningNodes.length === 1 ? 'one' : 'other'
+  const summary = t(`orchestration.scheduler.summary.${countKey}`, { count: runningNodes.length })
+  return (
+    <section
+      className={css.scheduler}
+      data-orchestration-active-nodes={runningNodes.length}
+      data-orchestration-scheduling="continuous-ready-queue"
+      aria-label={t('orchestration.scheduler.aria', { summary })}
+      aria-live="polite"
+    >
+      <div className={css.schedulerHead}>
+        <strong>{t('orchestration.scheduler.title')}</strong>
+        <span>{summary}</span>
+      </div>
+      <p>{t('orchestration.scheduler.hint')}</p>
+      <ul aria-label={t('orchestration.scheduler.nodes.aria')}>
+        {runningNodes.map(task => <ScheduledNode key={task.taskId} task={task} t={t} />)}
+      </ul>
+    </section>
+  )
+}
+
+function StepRow({ childTask, dependencyLabels, step, workerLabel, workers, t }: {
+  readonly childTask?: DispatcherTask
   readonly dependencyLabels: readonly string[]
   readonly step: DispatcherPlanStep
+  readonly workerLabel: string
   readonly workers: readonly DispatcherWorker[]
   readonly t: Translate
 }) {
+  const terminalChild = step.status === 'completed'
+    || childTask === undefined
+    || childTask.status === 'running'
+    ? undefined
+    : childTask
+  const visibleStatus = terminalChild?.status ?? step.status
+  const visibleStatusLabel = terminalChild === undefined
+    ? t(STEP_STATUS_KEYS[step.status])
+    : t(TASK_STATUS_KEYS[terminalChild.status])
+  const visibleStatusDot = terminalChild === undefined
+    ? stepDot(step.status)
+    : taskDot(terminalChild.status)
   const dependencies = dependencyLabels.join(', ')
   const dependencyText = dependencyLabels.length === 0
     ? t('step.dependency.none')
@@ -390,33 +480,60 @@ function StepRow({ dependencyLabels, step, workers, t }: {
     ? t('step.dependency.aria.none', { step: step.id })
     : t('step.dependency.aria.some', { step: step.id, ids: dependencies })
   return (
-    <li className={css.step} data-step-status={step.status}>
-      <div className={css.stepRail}><StateDot state={stepDot(step.status)} /></div>
+    <li className={css.step} data-step-status={visibleStatus}>
+      <div className={css.stepRail}><StateDot state={visibleStatusDot} /></div>
       <div className={css.stepBody}>
         <div className={css.stepHead}>
           <code className={css.stepId}>{step.id}</code>
           <strong>{step.title}</strong>
-          <span className={css.stepStatus}>{t(STEP_STATUS_KEYS[step.status])}</span>
+          <span className={css.stepStatus}>{visibleStatusLabel}</span>
         </div>
         {step.objective === '' ? null : <p className={css.stepObjective}>{step.objective}</p>}
         <div className={css.stepMeta}>
           <span aria-label={dependencyAria}>{dependencyText}</span>
           <span>{t('step.attempts', { count: step.attempts })}</span>
         </div>
-        <WorkerList label={t('workers.step')} scope={step.title} workers={workers} t={t} />
+        <WorkerList label={workerLabel} scope={step.title} workers={workers} t={t} />
       </div>
     </li>
   )
 }
 
-function PlanBody({ plan, task, t }: {
+function PlanContext({ scope, t }: { readonly scope: PlanScope; readonly t: Translate }) {
+  if (scope === 'linear') return null
+  const prefix = scope === 'macro' ? 'plan.scope.macro' : 'plan.scope.node'
+  return (
+    <div className={css.planContext}>
+      <h4>{t(`${prefix}.title`)}</h4>
+      <p>{t(`${prefix}.description`)}</p>
+    </div>
+  )
+}
+
+function PlanBody({ childTasks, plan, scope, task, t }: {
+  readonly childTasks: readonly DispatcherTask[]
   readonly plan: DispatcherMasterPlan
+  readonly scope: PlanScope
   readonly task: DispatcherTask
   readonly t: Translate
 }) {
   const stepTitles = new Map(plan.steps.map(step => [step.id, step.title]))
+  const childByNode = new Map(childTasks.flatMap(child => (
+    child.orchestration === undefined ? [] : [[child.orchestration.nodeId, child] as const]
+  )))
+  const stepsAria = scope === 'macro'
+    ? t('steps.aria.macro', { task: task.title })
+    : scope === 'node-local'
+      ? t('steps.aria.node', { task: task.title })
+      : t('steps.aria', { task: task.title })
+  const stepWorkerLabel = scope === 'macro'
+    ? t('workers.macroStep')
+    : scope === 'node-local'
+      ? t('workers.localStep')
+      : t('workers.step')
   return (
-    <>
+    <div className={css.plan} data-plan-scope={scope}>
+      <PlanContext scope={scope} t={t} />
       <div className={css.planHead}>
         <span><StateDot state={planDot(plan.status)} />{t(PLAN_STATUS_KEYS[plan.status])}</span>
         <span>{t('task.planMeta', {
@@ -429,26 +546,29 @@ function PlanBody({ plan, task, t }: {
       {plan.steps.length === 0
         ? <p className={css.emptySteps}>{t('steps.empty')}</p>
         : (
-          <ol className={css.steps} aria-label={t('steps.aria', { task: task.title })}>
+          <ol className={css.steps} aria-label={stepsAria}>
             {plan.steps.map(step => (
               <StepRow
                 key={step.id}
+                childTask={childByNode.get(step.id)}
                 step={step}
                 dependencyLabels={step.dependsOn.map((dependencyId) => {
                   const title = stepTitles.get(dependencyId)
                   return title === undefined ? dependencyId : `${title} (${dependencyId})`
                 })}
+                workerLabel={stepWorkerLabel}
                 workers={task.workers.filter(worker => worker.stepId === step.id)}
                 t={t}
               />
             ))}
           </ol>
         )}
-    </>
+    </div>
   )
 }
 
-function TaskCard({ parentTitle, task, t }: {
+function TaskCard({ childTasks, parentTitle, task, t }: {
+  readonly childTasks: readonly DispatcherTask[]
   readonly parentTitle?: string
   readonly task: DispatcherTask
   readonly t: Translate
@@ -456,10 +576,14 @@ function TaskCard({ parentTitle, task, t }: {
   const [open, setOpen] = useState(task.status === 'running')
   const stepIds = new Set(task.masterPlan?.steps.map(step => step.id) ?? [])
   const taskWorkers = task.workers.filter(worker => worker.stepId === undefined || !stepIds.has(worker.stepId))
+  const scope = planScope(task, childTasks)
+  const taskWorkerLabel = scope === 'macro'
+    ? t('workers.master')
+    : scope === 'node-local'
+      ? t('workers.node')
+      : t('workers.task')
   const status = t(TASK_STATUS_KEYS[task.status])
-  const phase = task.distribution?.state === 'running' && task.workers.length === 0
-    ? t('distribution.phase.unreported')
-    : t(PHASE_KEYS[task.phase])
+  const phase = taskPhaseLabel(task, t)
   return (
     <li className={css.task} data-task-status={task.status}>
       <DisclosureRow
@@ -483,20 +607,32 @@ function TaskCard({ parentTitle, task, t }: {
             <code>{task.taskId}</code>
             <span>{t('task.meta', { lane: task.lane, phase })}</span>
             {task.orchestration === undefined ? null : (
-              <span>{t('task.orchestration.parent', {
-                parent: parentTitle ?? task.orchestration.parentTaskId,
-                node: task.orchestration.nodeId,
-                depth: task.orchestration.depth,
-              })}</span>
+              <>
+                <span className={css.scopeBadge}>{t('task.orchestration.workerScope')}</span>
+                <span>{t('task.orchestration.parent', {
+                  parent: parentTitle ?? task.orchestration.parentTaskId,
+                  node: task.orchestration.nodeId,
+                  depth: task.orchestration.depth,
+                })}</span>
+              </>
             )}
           </div>
           {task.distribution === undefined
             ? null
             : <DistributionSummary distribution={task.distribution} t={t} />}
-          <WorkerList label={t('workers.task')} scope={task.title} workers={taskWorkers} t={t} />
+          <WorkerList label={taskWorkerLabel} scope={task.title} workers={taskWorkers} t={t} />
           {task.masterPlan === undefined
-            ? <p className={css.noPlan}>{t(task.distribution === undefined ? 'task.noPlan' : 'task.noPlan.distributed')}</p>
-            : <PlanBody plan={task.masterPlan} task={task} t={t} />}
+            ? <p className={css.noPlan}>{t(
+                task.distribution !== undefined
+                  ? 'task.noPlan.distributed'
+                  : scope === 'macro'
+                    ? 'task.noPlan.macro'
+                    : scope === 'node-local'
+                      ? 'task.noPlan.node'
+                      : 'task.noPlan',
+              )}</p>
+            : <PlanBody childTasks={childTasks} plan={task.masterPlan} scope={scope} task={task} t={t} />}
+          <HostSchedulerSummary childTasks={childTasks} t={t} />
           {task.result === undefined || task.result.message === '' ? null : (
             <section className={css.result}>
               <h4>{t('task.result')}</h4>
@@ -519,6 +655,17 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
     return right.updatedAt - left.updatedAt
   }), [tasks])
   const taskTitles = useMemo(() => new Map(tasks.map(task => [task.taskId, task.title])), [tasks])
+  const childTasksByParent = useMemo(() => {
+    const byParent = new Map<string, DispatcherTask[]>()
+    for (const task of tasks) {
+      const parentTaskId = task.orchestration?.parentTaskId
+      if (parentTaskId === undefined) continue
+      const childTasks = byParent.get(parentTaskId) ?? []
+      childTasks.push(task)
+      byParent.set(parentTaskId, childTasks)
+    }
+    return byParent
+  }, [tasks])
   const summary = headerSummary(state, t)
   const runningTasks = tasks.filter(task => task.status === 'running')
   const latestTerminal = newestTask(tasks)
@@ -572,6 +719,7 @@ export function TaskDispatcherAction({ useTaskDispatcher, t }: TaskDispatcherAct
                       <TaskCard
                         key={task.taskId}
                         task={task}
+                        childTasks={childTasksByParent.get(task.taskId) ?? []}
                         parentTitle={task.orchestration === undefined
                           ? undefined
                           : taskTitles.get(task.orchestration.parentTaskId)}

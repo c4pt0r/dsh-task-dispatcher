@@ -1,6 +1,6 @@
 # dsh-task-dispatcher
 
-An independent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that sends bounded work to isolated child Sessions and requires independent model verification. A lane can use the original executor-to-verifier pipeline, add a read-only planner that maintains a bounded evaluator-gated master plan, or opt into Host-owned local read-only DAG orchestration. Each configured lane owns every model route, tool allow-list, retry and planning budget, timeout, and mandatory acceptance criterion. Local execution remains the default; an opt-in distributed read-only mode leases complete tasks to remote DSH workers through PostgreSQL.
+An independent [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) bundle that sends bounded work to isolated child Sessions and requires independent model verification. A lane can use the original executor-to-verifier pipeline, add a read-only planner that maintains a bounded evaluator-gated plan, or opt into hierarchical orchestration: a Master Planner proposes a coarse semantic DAG, the Host selects bounded dependency-ready work, and each Worker focuses on one node. Each configured lane owns every model route, tool allow-list, retry and planning budget, timeout, and mandatory acceptance criterion. Local execution remains the default; an opt-in distributed read-only mode leases complete tasks to remote DSH workers through PostgreSQL.
 
 The parent Session stays the control plane. Execution and verification run in child Sessions, so competing models never append concurrently to the same parent Session.
 
@@ -71,32 +71,41 @@ Dynamic recursive orchestration is opt-in. Create a non-orchestrating,
 read-only child lane, then enable **Safe subtask orchestration** on a parent
 lane and select that child lane. Keep `maxPlanPatches > 0`, provide enough
 shared node/model-run budget, save, and restart DSH. The Host may then revise
-only the never-started part of the DAG after a fully accepted wave; completed
-nodes remain immutable. See [Host-owned recursive orchestration](#host-owned-recursive-orchestration-v1)
+only the never-started part of the DAG when the in-flight Worker pool reaches a
+quiescent boundary; running and completed nodes remain immutable. See
+[Host-owned recursive orchestration](#host-owned-recursive-orchestration-v1)
 for the exact v1 boundary.
+
+The bundled `general-analysis` lane is planner-enabled but **not** recursively
+orchestrating. Unless an operator explicitly enables `orchestration` on a
+separate lane, it continues to run one adaptive linear Master Plan rather than
+creating concurrent Workers.
 
 ## Core ideas
 
 1. **Models propose; the Host owns authority.** A model may propose a plan,
    patch, child DAG, or evidence. Only the Host selects routes, tools,
    workspaces, budgets, leases, plan revisions, and terminal status.
-2. **Success requires independent verification.** Executor self-reports are
+2. **Planning is hierarchical.** The Master describes outcomes, dependencies,
+   contracts, coverage, and scheduling hints. A Worker receives one node and
+   plans only that node. Neither role owns scheduling authority.
+3. **Success requires independent verification.** Executor self-reports are
    evidence, never acceptance. A distinct verifier must cover every immutable
    criterion with a passing result and non-empty evidence.
-3. **Policy is stronger than prompt text.** Objectives cannot select a model,
+4. **Policy is stronger than prompt text.** Objectives cannot select a model,
    add a tool, broaden a sandbox, change lanes, or mint recursive authority.
    Those choices come only from deployment-owned lane configuration.
-4. **Plans are adaptive but effects are fenced.** Linear plans replace only
+5. **Plans are adaptive but effects are fenced.** Linear plans replace only
    their pending suffix. Recursive DAGs replace only never-started nodes at a
-   fully joined wave boundary, after independent patch review and revision
-   compare-and-set.
-5. **Budgets decrease monotonically.** Depth, node, fan-out, concurrency,
+   quiescent scheduling boundary where no Worker remains in flight, after
+   independent patch review and revision compare-and-set.
+6. **Budgets decrease monotonically.** Depth, node, fan-out, concurrency,
    model-run, attempt, deadline, output, and lease limits are checked before
    publication. Started work never refunds model authority.
-6. **Uncertainty fails closed.** Missing structured output, stale leases,
+7. **Uncertainty fails closed.** Missing structured output, stale leases,
    invalid evidence, cleanup uncertainty, policy drift, or exhausted budgets
    cannot become accepted. Uncertain local cleanup quarantines the workspace.
-7. **Durability is explicit, not implied.** Local plans and Jobs are
+8. **Durability is explicit, not implied.** Local plans and Jobs are
    process-local. Distributed v1 durably leases a complete read-only task, but
    does not checkpoint individual planner/executor/verifier phases.
 
@@ -115,28 +124,42 @@ flowchart TB
   Settings -->|"validated policy on restart"| Host
   Host --> Telemetry --> Web
 
-  subgraph Local["Local execution"]
+  subgraph Local["Local hierarchical execution"]
     LocalShape{"Configured local lane shape"}
     Classic["Classic pipeline<br/>executor → independent verifier"]
-    Planner["Planner"]
-    PlanReview["Independent plan reviewer"]
-    Plan["Host-owned Master Plan<br/>revision · history · CAS"]
-    Scheduler["Wave scheduler + grant ledger"]
-    ChildA["Complete fixed child-lane pipeline A"]
-    ChildB["Complete fixed child-lane pipeline B"]
+    Adaptive["Adaptive linear plan<br/>plan/review → one step at a time → final verifier"]
+    Master["Master Planner<br/>coarse outcomes + semantic DAG"]
+    PlanReview["Independent macro-plan reviewer"]
+    Plan["Host-owned Master DAG<br/>contracts · revision · immutable history"]
+    Scheduler["Host Ready Queue<br/>critical path · unlock value · global capacity"]
+    GrantA["Worker envelope A<br/>node A + direct verified evidence + Host grant"]
+    GrantB["Worker envelope B<br/>node B + direct verified evidence + Host grant"]
+    ChildA["Worker A<br/>node-local plan → execute → verify"]
+    ChildB["Worker B<br/>node-local plan → execute → verify"]
+    Settled["Worker settled<br/>record accepted evidence · release slot"]
+    InFlight{"Other Workers still in flight?"}
+    Backfill["Immediately backfill ready work"]
+    Checkpoint{"Safe patch budget<br/>and unstarted nodes remain?"}
+    Drain["Close new admission<br/>drain current in-flight pool"]
+    Barrier["Quiescent scheduling boundary<br/>in-flight pool empty"]
     Final["Final independent verifier"]
     LocalResult["Criterion-gated local result"]
 
     LocalShape -->|"planner omitted"| Classic --> LocalResult
-    LocalShape -->|"planner configured"| Planner
-    Planner --> PlanReview --> Plan
+    LocalShape -->|"planner configured, orchestration disabled"| Adaptive --> LocalResult
+    LocalShape -->|"orchestration enabled"| Master
+    Master --> PlanReview --> Plan
     Plan --> Scheduler
-    Scheduler --> ChildA
-    Scheduler --> ChildB
-    ChildA -->|"bounded evidence"| Plan
-    ChildB -->|"bounded evidence"| Plan
-    Plan -->|"keep / reviewed pending-DAG patch"| Scheduler
-    Scheduler --> Final --> LocalResult
+    Scheduler --> GrantA --> ChildA --> Settled
+    Scheduler --> GrantB --> ChildB --> Settled
+    Settled --> InFlight
+    InFlight -->|"yes"| Backfill --> Checkpoint
+    Checkpoint -->|"no: throughput-first rolling"| Scheduler
+    Checkpoint -->|"yes: eventual replan checkpoint"| Drain --> Barrier
+    InFlight -->|"no: grants settled and cleanup complete"| Barrier
+    Barrier -->|"accepted, Host-sealed evidence"| Plan
+    Plan -->|"keep / reviewed replacement of never-started DAG"| Scheduler
+    Plan -->|"no pending nodes"| Final --> LocalResult
   end
 
   subgraph Distributed["Distributed read-only execution v1"]
@@ -160,11 +183,18 @@ lost worker reruns the complete read-only task instead of resuming mid-plan.
 Writable recursive worktree primitives exist as experimental Host libraries,
 but are not connected to active lanes or remote workers.
 
+The architecture separates three different kinds of knowledge. The Master
+Planner sees the root objective and constructs the macro DAG, but does not
+write commands or implementation steps. The Host sees the complete validated
+DAG and all resource state, and is the only scheduler. A Worker sees only its
+current node contract, directly required accepted evidence, global invariants,
+and an attenuated Host grant; it does not receive sibling or future nodes.
+
 | Mode | Plan shape | Revision point | Parallelism | Durable state |
 |---|---|---|---|---|
 | Local classic | No plan: executor then verifier | Optional executor retry only | One child phase at a time | Process-local |
 | Local adaptive | Ordered Master Plan | After a verified step, replace only the pending suffix | One plan step at a time | Process-local |
-| Local orchestration | Dependency DAG | After a fully accepted wave, replace only never-started nodes | Bounded ready-wave parallelism | Process-local |
+| Local orchestration | Contract-bearing macro DAG; optional node-local plans inside Workers | At a natural or bounded eventual quiescent checkpoint, replace only never-started nodes | Prioritized rolling backfill with bounded replan checkpoints | Process-local |
 | Distributed v1 | One worker runs the complete classic or adaptive pipeline | Inside that worker; recursive DAG is disabled | Across whole tasks/workers, not across machines within one task | Envelope, lease, cancellation, and terminal result |
 
 ## What it guarantees
@@ -195,12 +225,19 @@ For every `dispatch_task` call, the plugin:
 8. Repeats an executor or permits final-review remediation only when deployment
    policy explicitly enables `retryOnRevise` and the relevant attempt, patch,
    child-run, and deadline budgets still permit it.
-9. For an orchestration-enabled lane, admits child authority lazily one ready
-   wave at a time. After a fully accepted wave has joined and cleaned up, the
-   Host may ask the planner to keep the remaining DAG, report a blocker, or
-   replace only nodes that have never started. A replacement is independently
-   reviewed and committed with a compare-and-set plan revision before any new
-   child receives authority.
+9. For an orchestration-enabled lane, maintains a bounded in-flight pool from a
+   dependency-ready queue. The Host ranks ready nodes by critical-path cost,
+   immediate unlock value, and downstream reach before applying configured
+   capacity. When one Worker settles while another remains in flight, the Host
+   immediately admits newly ready work into the released slot. If that refill
+   leaves unstarted nodes and safe patch budget remains, the Host then closes
+   further admission and drains the current pool, guaranteeing an eventual
+   quiescent checkpoint instead of starving dynamic planning. Without safe
+   replan budget it keeps rolling for throughput. Only at a quiescent
+   checkpoint may the Master keep the remaining DAG, report a blocker, or
+   propose replacement of nodes that have never started. A replacement is
+   independently reviewed and committed with a compare-and-set plan revision.
+   Running and completed nodes are never patch targets.
 
 An accepted result is **model-verified**. It is not a formal proof, a security certification, or human approval. The executor's own success claim is never sufficient for acceptance.
 
@@ -291,8 +328,9 @@ and run again rather than resuming its interrupted plan.
 ## Host-owned recursive orchestration (v1)
 
 Recursive orchestration is an opt-in property of a configured lane. In v1 it
-is deliberately limited to **local, spawn-only, read-only** execution with
-`workspaceMode: read-shared`. Both the orchestration lane and its fixed
+is deliberately limited to **local + `spawn` + read-only** execution with
+`workspaceMode: read-shared`. It is not enabled on the bundled
+`general-analysis` lane. Both the orchestration lane and its fixed
 `childLane` must run locally, use `spawn`, and expose only `read`, `read_image`,
 `glob`, and `grep`. The child lane is selected by deployment configuration,
 must be a `general` lane, and cannot add tools that the parent lane does not
@@ -304,50 +342,104 @@ The v1 dynamic-DAG lifecycle is:
 
 ```mermaid
 flowchart TD
-  P["Planner proposes typed child DAG"] --> R["Independent DAG review"]
-  R --> V["Host validates scope · coverage · acyclicity · budgets"]
-  V --> W["Lazily reserve one dependency-ready wave"]
-  W --> C["Run complete fixed-lane child pipelines<br/>in bounded parallel"]
-  C --> J["Join every child · settle every grant · finish cleanup"]
-  J --> Q{"Pending nodes?"}
+  P["Master Planner<br/>propose coarse contract-bearing DAG"] --> R["Independent macro-DAG review"]
+  R --> V["Host validates dependencies · contracts · coverage · budgets"]
+  V --> W["Host fills bounded in-flight pool from Ready Queue<br/>critical path · unlock value · capacity"]
+  W --> EA["Envelope A<br/>current node + direct verified evidence + Host grant"]
+  W --> EB["Envelope B<br/>current node + direct verified evidence + Host grant"]
+  EA --> CA["Worker A<br/>node-local plan → execute → verify"]
+  EB --> CB["Worker B<br/>node-local plan → execute → verify"]
+  CA --> S["Settle one Worker<br/>finish cleanup · seal accepted evidence · release slot"]
+  CB --> S
+  S --> I{"Any Worker still in flight?"}
+  I -->|"yes"| BF["Immediately backfill one ready slot"]
+  BF --> CP{"Unstarted nodes remain<br/>and safe patch budget exists?"}
+  CP -->|"no: keep throughput-first rolling"| W
+  CP -->|"yes"| D["Request checkpoint<br/>close new admission · drain current pool"]
+  D --> Q
+  I -->|"no: quiescent scheduling boundary"| Q{"Pending nodes?"}
   Q -->|"no"| F["Final independent root verifier"]
   Q -->|"yes, no safe replan budget"| W
-  Q -->|"yes"| RP{"Replanner decision"}
+  Q -->|"yes, accepted state + replan budget"| RP{"Master replanner decision"}
   RP -->|"keep"| W
   RP -->|"blocked"| B["Blocked result"]
-  RP -->|"replace_pending"| PR["Independent patch review + revision CAS"]
+  RP -->|"replace_pending"| PR["Review + revision CAS<br/>replace never-started nodes only"]
   PR -->|"accepted"| W
   PR -->|"rejected / blocked"| X["Non-accepted result"]
 ```
 
-The planner proposes typed child ids, objectives, dependencies, logical
-deliverable scope, local acceptance criteria, and coverage of the immutable
-root criteria. It does not choose a provider, model, tool, workspace, child
-lane, budget, or concurrency. The Host validates the proposal as an acyclic,
-scope-contained DAG, owns every state transition, and starts at most
-`maxConcurrentNodes` ready children at once. Each child runs the complete
-pipeline of its fixed lane and must be independently accepted before it can
-satisfy a dependency. Accepted child reports are evidence for the final root
-verifier, never automatic proof that the root task succeeded.
+### Master, Host, and Worker information boundaries
 
-The current DAG is Host-owned and can change between waves. A replanner runs
-only after the entire preceding wave has joined, every child grant has settled,
-and no pending node owns execution authority. It receives bounded structured
+The **Master Planner** proposes typed node ids, outcomes, dependencies,
+input/output contracts, logical deliverable scope, local acceptance criteria,
+coverage of immutable root criteria, and resource-class/estimated-cost hints.
+It should decompose the project at independently verifiable outcome boundaries.
+It must not prescribe commands, exact edits, model calls, tools, providers,
+working directories, child lanes, budgets, grants, or the number of Workers to
+start. Those are implementation and authority decisions, not macro-plan data.
+
+The **Host Scheduler** owns the complete validated DAG and the live truth. It
+derives the ready set from accepted dependencies, ranks candidates by critical
+path, immediate unlock count, and downstream reach, then applies active
+capacity before minting any grant. The public scheduler core can additionally
+enforce per-provider, model, resource-class, workspace, and conflict-key
+quotas. During rolling execution the active dispatcher invokes that core as
+Workers settle, except after it deliberately closes admission for an eventual
+replan checkpoint. Its lane runtime currently relies primarily on the
+whole-tree `maxConcurrentNodes` limit, its fixed child-lane/workspace context,
+and the FIFO Host grant ledger. The broader provider/model/resource quota
+surface is available to trusted Host integrations; it is not currently exposed
+as lane runtime configuration.
+
+The **Worker** receives a least-context envelope: its current node outcome,
+local input/output and acceptance contracts, global invariants relevant to that
+node, and bounded verified evidence for directly referenced dependencies,
+plus its bounded Host grant. It does not receive the complete DAG, sibling
+objectives, future nodes, or authority to edit the Master Plan. A child lane
+with its own planner may form a node-local mini-plan, but that mini-plan remains
+inside the Worker pipeline and never becomes a global DAG patch by itself.
+
+Each Worker runs the complete pipeline of its fixed lane and must be
+independently accepted before it can satisfy a dependency. Accepted child
+reports are sealed into bounded dependency evidence for downstream nodes and
+the final root verifier; they are never automatic proof that the root task
+succeeded.
+
+The current DAG is Host-owned. Rolling execution begins throughput-first:
+whenever one Worker settles while at least one other Worker remains in flight,
+the scheduler recomputes the ready queue and may immediately start an accepted
+dependency's newly unlocked critical successor. It does not wait for an
+unrelated slow sibling before using that released slot.
+
+Rolling is deliberately bounded so it cannot starve dynamic planning forever.
+After one refill, if unstarted nodes still remain, every recorded outcome is
+accepted, and enough patch/model-run budget remains for safe replanning and
+review, the Host requests a checkpoint. It closes new admissions but does not
+cancel current Workers; their bounded child deadlines let the existing pool
+drain to an eventual quiescent state. If those safe replan conditions are not
+met, the Host does not create an unnecessary throughput bubble and continues
+rolling admissions instead.
+
+The Master may change the DAG only when the in-flight pool drains completely,
+every child grant has settled, and cleanup has finished. This is the
+**quiescent scheduling boundary**. The replanner receives bounded structured
 evidence, not raw child streams. `keep` leaves the revision unchanged;
 `replace_pending` supplies the complete new never-started DAG and receives a
 separate plan review. The Host preserves every completed node byte-for-byte,
-rejects mutation of a retained pending id, forbids reuse of any removed id,
-revalidates dependencies and immutable criterion/deliverable coverage, and
-commits only if the proposed `baseRevision` still matches. The next wave is
-reserved only after that atomic plan update, so a removed node can never start
-with stale authority.
+never includes a running node in the patchable set, rejects mutation of a
+retained pending id, forbids reuse of any removed id, revalidates dependencies
+and immutable criterion/deliverable coverage, and commits only if the proposed
+`baseRevision` still matches. New admissions occur only after that atomic plan
+decision, so a removed node can never start with stale authority. No patch can
+alter a running or completed node.
 
 Dynamic patches are optional and budgeted by `maxPlanPatches` plus the shared
 model-run ledger. Mandatory pending children and the final verifier are funded
 before optional replanning. If no safe surplus remains, the Host continues the
-reviewed DAG without starting a replanner. This v1 replans from accepted-wave
-evidence only: a failed wave still terminates or leaves dependency-blocked work
-according to `failureMode`, and a final-verifier gap does not create a new DAG.
+reviewed DAG without starting a replanner. This v1 replans only from accepted
+evidence accumulated before a quiescent boundary: failed work still terminates
+or leaves dependency-blocked work according to `failureMode`, and a
+final-verifier gap does not create a new DAG.
 
 One Host-owned authority ledger is shared by the entire recursive tree. Opaque
 grants monotonically attenuate the configured depth, total task-node, per-node
@@ -369,10 +461,31 @@ Like other local master plans, the DAG, grants, live child state, and progress
 journal are process-local. V1 does not split one recursive tree across remote
 workers and cannot resume it after a Host restart.
 
-### Experimental Host libraries
+### Public Host-side planning modules
 
-The package currently exports two experimental, Host-side building blocks.
-They are tested libraries, not active dispatcher capabilities:
+The package exports two pure planning/scheduling modules introduced for this
+hierarchical boundary. They do not run models, start children, or grant tools:
+
+- `dsh-task-dispatcher/macro-planning` exports `normalizeMacroPlan`,
+  `validateMacroPlan`, and `buildWorkerEnvelope`. It strictly validates a
+  contract-bearing macro DAG, rejects implementation/authority fields, checks
+  dependencies, root coverage, contract references, historical ids, and
+  repository-relative scope proposals, then projects one deeply frozen Worker
+  envelope without the complete DAG. The active dispatcher uses the same
+  hierarchy and compatible orchestration contracts, while this standalone
+  module is the reusable exact boundary for further Host integration.
+- `dsh-task-dispatcher/ready-scheduler` exports
+  `validateReadySchedulerDag` and `scheduleReadyNodes`. It is a deterministic,
+  side-effect-free admission core with critical-path/unlock prioritization,
+  global and per-resource capacity, conflict keys, failure propagation, and
+  diagnostics. The dispatcher calls it repeatedly to backfill released slots
+  while other Workers remain in flight, unless the Host has closed admission
+  to reach a bounded replan checkpoint. Per-provider, model, resource-class,
+  workspace, and conflict-key limits remain public Host-core inputs rather
+  than active lane runtime settings.
+
+The package also exports two experimental mutation-oriented Host building
+blocks. They remain tested libraries, not active dispatcher capabilities:
 
 - `dsh-task-dispatcher/workspace-isolation` validates repository-relative write
   scopes and contains path-lease and Git workspace command-planning primitives.
@@ -384,9 +497,14 @@ They are tested libraries, not active dispatcher capabilities:
   `dispatch_task`, the Settings save path, or active lane policy. A dispatched
   task cannot use it to persistently change configuration or global rules.
 
-Both modules require explicit trusted Host integration and may change while
-experimental. Merely importing or packaging them does not grant a model any
-tool or mutation authority.
+All four modules require a trusted Host to provide live state and enforce their
+decisions. The first two are pure contract/scheduling boundaries; the latter
+two may change while their mutation workflows remain experimental. Merely
+importing or packaging any module does not grant a model a tool, workspace, or
+mutation authority. In particular, validating a `workspace-write` proposal
+with `macro-planning` does not make writable orchestration available: active
+orchestration still rejects every workspace mode except read-only
+`read-shared`.
 
 ## Distributed read-only execution (v1)
 
@@ -640,6 +758,10 @@ history. Open it to see:
 - for a local task, the current master-plan revision and completed-step count;
 - for a local task, each step's prerequisite, displayed as a vertical
   dependency chain;
+- for an orchestration parent, an explicit **Master Plan / macro DAG** label
+  and the ready nodes currently selected by Host scheduling;
+- for an orchestration child, an explicit **Worker node-local execution** label
+  rather than presenting its private pipeline as another global plan;
 - for a local task, the planner, executor, reviewer, or verifier attached to
   each step, plus the child Agent id and selected provider/model; and
 - reconnecting, blocked, rejected, cancelled, and error states with both text
@@ -657,10 +779,10 @@ future protocol extension.
 The ordinary adaptive master-plan contract remains linear: the Host executes
 its first pending step and each step depends on the preceding step. An
 orchestration-enabled local lane instead publishes its validated DAG and the
-Host may run a bounded dependency-ready wave in parallel. The view renders the
-reported `dependsOn` edges and active Agents for either shape; it does not
-invent dependencies, workers, or parallelism that Host telemetry did not
-report.
+Host may keep a bounded dependency-ready Worker pool filled in parallel. The
+view renders the reported `dependsOn` edges, Host-selected ready nodes, and
+active Agents for either shape; it does not invent dependencies, Workers,
+admissions, or parallelism that Host telemetry did not report.
 
 The Host publishes bounded, session-filtered snapshots through a loopback-only
 RPC channel. The browser takes a baseline snapshot and then uses
@@ -724,9 +846,10 @@ from loading before this plugin starts and also requires manual repair.
 
 Use a classic lane for one bounded executor/verifier exchange, an adaptive lane
 for an ordered task whose remaining steps may change, and an orchestration lane
-for a local read-only DAG with bounded parallel waves. Use distributed mode
-only when complete read-only tasks need durable queueing or placement across
-workers. Lane selection never overrides the policy configured for that lane.
+for a local read-only DAG with rolling backfill and bounded replan checkpoints.
+Use distributed mode only when complete read-only tasks need durable queueing or
+placement across workers. Lane selection never overrides the policy configured
+for that lane.
 
 Before dispatching, verify that:
 
@@ -736,6 +859,36 @@ Before dispatching, verify that:
 - mutating work uses an exact `workspace-write` sandbox and protected
   `liveRoot`; and
 - Settings changes have been saved and the DSH Host has been restarted.
+
+### Choose when to use the macro DAG
+
+Enable orchestration only when the root objective contains independently
+verifiable branches whose inputs and outputs can be expressed as contracts.
+Good examples are parallel repository inspection, independent subsystem
+analysis, or separately verifiable research branches followed by one synthesis
+node. Keep a linear adaptive lane when every step depends on the exact result
+of the previous step or when coordination overhead would dominate the work.
+
+Configuration determines physical authority:
+
+- `orchestration.enabled` changes the parent from a linear adaptive plan to a
+  Host-owned macro DAG;
+- `childLane` fixes the policy used by every immediate Worker;
+- `maxConcurrentNodes` is a ceiling for Host admissions, not a request that the
+  Master fill every slot;
+- `maxTaskNodes`, `maxChildrenPerNode`, `maxDepth`, and
+  `maxTotalModelRuns` bound the complete tree; and
+- `workspaceMode: read-shared` is the only active v1 workspace mode.
+
+The Master should expose semantic independence through `dependsOn` and explicit
+input/output contracts. It should not add fake ordering merely to control
+capacity, nor place commands, models, tools, or Worker counts in an objective.
+The Host normally recomputes ready work as Workers settle and immediately
+backfills free capacity while another Worker remains in flight. After one
+refill, remaining unstarted work plus safe patch budget causes Host admission to
+close temporarily; the existing pool drains into a bounded eventual checkpoint
+where the Master can keep or safely replace the never-started DAG with revision
+CAS. If no safe replan budget exists, rolling throughput continues.
 
 ### Install locally
 
@@ -931,15 +1084,15 @@ Recursive orchestration settings are:
 | Field | Default | Meaning |
 |---|---:|---|
 | `enabled` | `false` | Enable Host-owned recursive DAG planning for this lane. |
-| `childLane` | empty | Fixed deployment-owned lane used for every immediate child. Required when enabled. |
+| `childLane` | empty | Fixed deployment-owned lane used for every immediate Worker node. Required when enabled. |
 | `maxDepth` | `2` | Shared recursive depth ceiling, from 1 through 4. |
 | `maxTaskNodes` | `16` | Shared node budget for the complete tree, from 1 through 32. |
 | `maxChildrenPerNode` | `4` | Maximum immediate fan-out at one node, from 1 through 8. |
-| `maxConcurrentNodes` | `4` | Maximum active nodes in the complete tree and maximum ready-wave width, from 1 through 8. |
+| `maxConcurrentNodes` | `4` | Maximum active nodes in the complete tree and width of the rolling in-flight pool, from 1 through 8. Checkpoint drain may intentionally leave capacity idle. |
 | `maxTotalModelRuns` | `48` | Shared model-run credits for every planner, reviewer, child pipeline, and final verifier, from 1 through 128; an enabled lane must fund its complete minimum verified path. |
 | `maxResultBytes` | `131072` | Maximum joined child evidence and orchestration result size, from 4,096 through 1,048,576 bytes. |
 | `workspaceMode` | `read-shared` | V1 accepts only `read-shared`; `isolated-write` is reserved and rejected. |
-| `failureMode` | `fail-fast` | `fail-fast` cancels a ready wave after a failure; `collect` waits for the wave and reports failed or dependency-blocked work. |
+| `failureMode` | `fail-fast` | `fail-fast` cancels remaining in-flight siblings after a failure; `collect` continues independent ready work and reports failed or dependency-blocked work. |
 
 Enabling orchestration requires a planner route. The parent and fixed child
 lanes must both be local `spawn` lanes, all of their tools must be read-only,
@@ -953,8 +1106,10 @@ can override.
 
 The Web form is the recommended editor. For a deployment-owned base or a
 carefully managed `$DSH_HOME/settings.yaml`, the following illustrates the two
-lane roles. The leaf executes one verified unit; the parent owns the dynamic
-DAG and may replace never-started nodes after a successful wave.
+lane roles. The Worker lane executes one verified node and may create only a
+node-local plan. The parent owns the macro DAG and may replace never-started
+nodes only when the in-flight pool reaches a successful quiescent scheduling
+boundary.
 
 ```yaml
 dsh-task-dispatcher:
@@ -1185,6 +1340,14 @@ These layers make task failures non-fatal and let a supervisor recover process o
   concurrency 1-8, model-run budget 1-128, and joined result limit
   4,096-1,048,576 bytes. Activation additionally requires enough nodes and
   model runs for a complete independently verified leaf path.
+- The active orchestration runtime uses rolling backfill for its bounded
+  in-flight pool from a prioritized dependency-ready queue. After one refill,
+  remaining unstarted nodes and safe patch budget trigger a bounded eventual
+  checkpoint: admission closes, current Workers drain, and only then may the
+  Master perform revision CAS. Without safe replan budget, the runtime keeps
+  rolling for throughput. The Ready Queue core supports per-resource quotas,
+  but active lane runtime configuration currently centers on whole-tree
+  `maxConcurrentNodes` and the FIFO Host grant ledger.
 - `taskTimeoutMs` is 1 second through 6 hours. `childTimeoutMs` is 1 second
   through 1 hour and applies separately to every planner, reviewer, executor,
   and verifier child.
