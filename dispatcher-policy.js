@@ -49,6 +49,12 @@ export const ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/u
 const TOOL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_.:-]{0,127}$/u
 export const DISTRIBUTED_REF_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}$/u
 export const READ_ONLY_TOOLS = new Set(['read', 'read_image', 'glob', 'grep'])
+
+// Tools that read outside the workspace but cannot write to it. `laneMayMutate`
+// asks about WORKSPACE mutation, so a network-read tool must not flip a lane
+// into the mutating branch (which demands liveRoot protection). The stricter
+// READ_ONLY_TOOLS set still governs `plannerTools`.
+export const NON_MUTATING_TOOLS = new Set([...READ_ONLY_TOOLS, 'web_fetch', 'web_search'])
 const RAW_DELEGATION_TOOLS = new Set([
   'dispatch_task',
   'dispatch_status',
@@ -198,7 +204,7 @@ export function minimumLaneExecutionCost(laneId, laneCatalog, remainingDepth, vi
 
 export function laneMayMutate(lane) {
   return [...lane.executorTools ?? [], ...lane.verifierTools ?? []]
-    .some(tool => !READ_ONLY_TOOLS.has(tool))
+    .some(tool => !NON_MUTATING_TOOLS.has(tool))
 }
 
 function validateRoute(route, label) {
@@ -285,7 +291,7 @@ export function validateDispatcherConfig(config) {
     validateToolNames(lane.executorTools, `dsh-task-dispatcher: lane ${id}.executorTools`)
     validateToolNames(lane.verifierTools, `dsh-task-dispatcher: lane ${id}.verifierTools`)
     validateToolNames(lane.plannerTools, `dsh-task-dispatcher: lane ${id}.plannerTools`)
-    if ((lane.verifierTools ?? []).some(tool => !READ_ONLY_TOOLS.has(tool))) {
+    if ((lane.verifierTools ?? []).some(tool => !NON_MUTATING_TOOLS.has(tool))) {
       throw new TypeError(`dsh-task-dispatcher: lane ${id}.verifierTools must be read-only`)
     }
     if ((lane.plannerTools ?? []).some(tool => !READ_ONLY_TOOLS.has(tool))) {

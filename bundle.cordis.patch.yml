@@ -46,11 +46,18 @@
                 text: Relevant tests pass, or the result gives a concrete reason they could not run.
               - id: regression
                 text: No obvious regression was found in the affected behavior.
+            # web_fetch is listed but optional: a deployment that does not
+            # mount dsh-tool-web simply runs without it (the dispatcher drops
+            # absent tools and names them in deployment_capabilities_json), so
+            # a lane meant for analysis can reach the open web wherever the
+            # host allows it without every operator editing this list.
             executorTools:
               - read
               - glob
               - grep
+              - web_fetch
             verifierTools:
               - read
               - glob
               - grep
+              - web_fetch

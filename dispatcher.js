@@ -7,6 +7,7 @@ import { DistributedWorker } from './distributed-worker.js'
 import {
   boundedSettlement,
   linkedDeadline,
+  registeredToolNames,
   runStructuredChild,
   runTelemetryChild,
 } from './dispatcher-child-runner.js'
@@ -43,7 +44,6 @@ import {
   MAX_PLAN_TEXT_LENGTH,
   MAX_TOTAL_CRITERIA_LENGTH,
   PolicyConfig,
-  READ_ONLY_TOOLS,
   TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION,
   TASK_DISPATCHER_CONFIG_RPC_CHANNEL,
   TASK_DISPATCHER_SETTINGS_NAMESPACE,
@@ -56,6 +56,7 @@ import {
   distributedTaskTimeoutMs,
   laneMayMutate,
   minimumLaneExecutionCost,
+  NON_MUTATING_TOOLS,
   orchestrationCorePolicy,
   registerDispatcherConfigRpc,
   resolveDispatcherConfig,
@@ -684,17 +685,40 @@ function planPromptSnapshot(plan) {
   }
 }
 
+/**
+ * Narrow one role's configured tools to what this deployment mounted, so the
+ * snapshot describes the child's real capability rather than the lane's wish.
+ * @param spec - the dispatched task spec.
+ * @param names - the lane's configured tool names for one role.
+ * @returns the names the child will actually be given.
+ */
+function presentTools(spec, names) {
+  const available = spec.availableToolNames
+  const requested = [...names ?? []]
+  return available === undefined ? requested : requested.filter(name => available.has(name))
+}
+
 function deploymentCapabilitySnapshot(spec) {
-  const executorTools = [...spec.lane.executorTools ?? []]
+  const executorTools = presentTools(spec, spec.lane.executorTools)
+  // Naming what is missing is the difference between an executor that returns
+  // status=blocked and one that invents a result for a tool it cannot call.
+  const unavailableTools = [
+    ...new Set([
+      ...spec.lane.executorTools ?? [],
+      ...spec.lane.verifierTools ?? [],
+      ...spec.lane.plannerTools ?? [],
+    ]),
+  ].filter(name => spec.availableToolNames !== undefined && !spec.availableToolNames.has(name))
   return {
+    ...unavailableTools.length === 0 ? {} : { unavailableTools },
     planShape: 'linear',
     executionMode: spec.lane.execution?.mode ?? 'local',
     transport: spec.lane.transport ?? 'spawn',
     workspace: spec.workspace,
-    workspaceMutationAllowed: executorTools.some(tool => !READ_ONLY_TOOLS.has(tool)),
+    workspaceMutationAllowed: executorTools.some(tool => !NON_MUTATING_TOOLS.has(tool)),
     executorTools,
-    plannerTools: [...spec.lane.plannerTools ?? []],
-    verifierTools: [...spec.lane.verifierTools ?? []],
+    plannerTools: presentTools(spec, spec.lane.plannerTools),
+    verifierTools: presentTools(spec, spec.lane.verifierTools),
     orchestration: {
       enabled: spec.lane.orchestration?.enabled === true,
       mode: spec.lane.orchestration?.workspaceMode ?? 'read-shared',
@@ -899,8 +923,32 @@ export function buildExecutorPrompt(spec, attempt, prior) {
     'Execute the task, collect concrete evidence, and return only the required structured report.',
     'Use only deployment_capabilities_json. If a required capability is absent or a tool did not make the requested change, return status=blocked.',
     'Never report an artifact as created or modified unless you actually created it or directly inspected it during this run.',
+    'Every child runs in its own isolated session: this report is the only thing the independent verifier ever sees. Do not describe what you did — put the concrete observed content in the evidence itself (verbatim excerpts, exact values, counts, identifiers), enough that a reader who never saw your tool output can check the claim.',
     'Your self-assessment is evidence for the verifier; it is never the final acceptance decision.',
   ].filter(Boolean).join('\n\n')
+}
+
+/**
+ * Shared verifier framing. A verifier child is a fresh session: no raw tool
+ * output from the executor's session can ever reach it, so "the report does not
+ * contain the raw tool output" is a property of the architecture rather than a
+ * defect in the work. Without this, a verifier judging any externally
+ * observable claim (a fetched page, a command result) rejects every attempt as
+ * unverifiable self-report and no plan can ever complete. Tell it what it can
+ * do instead: it holds its own read-only tools and is expected to use them.
+ * @param spec - the dispatched task spec whose lane owns the verifier tools.
+ * @returns the prompt lines to splice into a verifier prompt.
+ */
+function verifierEvidenceRules(spec) {
+  const tools = presentTools(spec, spec.lane.verifierTools)
+  return [
+    `your_tools_json:\n${safeJson(tools)}`,
+    tools.length === 0
+      ? 'You have no tools: judge the report on the specificity and internal consistency of its evidence alone.'
+      : 'You have your own tools listed in your_tools_json. Where a claim is independently checkable with them, check it yourself and record what YOU observed as your evidence.',
+    'Each child ran in its own isolated session, so raw tool transcripts cannot reach you and their absence is never itself a reason to fail a criterion. Judge the substance of the evidence: concrete quoted content, exact values, and identifiers count; a bare assertion that the work was done does not.',
+    'A live external source — a web page, a feed, an API, a clock-dependent command — can legitimately change between the moment the executor read it and the moment you read it. When your own observation differs from the report, that difference is drift, not fabrication: record both in your evidence and judge whether the report is internally consistent and plausibly derived from that source when it was read. Fail for fabrication only when the content could not have come from that source at any time, such as the wrong shape or a contradiction of its stable parts.',
+  ]
 }
 
 /** Build the independent verifier prompt from task data and executor evidence. */
@@ -922,6 +970,7 @@ export function buildVerifierPrompt(spec, attempt, executorReport) {
       workspace: spec.workspace,
     })}`,
     `executor_report_json:\n${safeJson(executorReport)}`,
+    ...verifierEvidenceRules(spec),
     'Return exactly one criterion result for every acceptance criterion id, with non-empty evidence for each pass.',
     'Return only the required structured decision.',
   ].join('\n\n')
@@ -1017,6 +1066,7 @@ export function buildPlanStepExecutorPrompt(spec, plan, step, attempt, prior) {
     prior === undefined ? '' : `previous_step_attempt_json:\n${safeJson(prior)}`,
     'Use only deployment_capabilities_json. If the current step needs a missing capability or a tool did not make the requested change, return status=blocked.',
     'Never report an artifact as created or modified unless you actually created it or directly inspected it during this run.',
+    'Every child runs in its own isolated session: this report is the only thing the independent verifier and every later step ever see. Do not describe what you did — put the concrete observed content in the evidence itself (verbatim excerpts, exact values, counts, identifiers), enough that a reader who never saw your tool output can check the claim.',
     'Return exactly one result for each current-step acceptance criterion. Your report cannot change the Host-owned plan status.',
     'Return only the required structured executor report.',
   ].filter(Boolean).join('\n\n')
@@ -1033,6 +1083,7 @@ export function buildPlanStepVerifierPrompt(spec, plan, step, attempt, executorR
     `immutable_task_json:\n${safeJson({ taskId: spec.taskId, objective: spec.objective })}`,
     `current_step_json:\n${safeJson(planStepStructure(step))}`,
     `executor_report_json:\n${safeJson(executorReport)}`,
+    ...verifierEvidenceRules(spec),
     'Return exactly one criterion result for every current-step acceptance criterion id. Every pass requires non-empty concrete evidence.',
     'Use decision=revise only when another bounded attempt can plausibly fix this same step.',
     'Return only the required structured decision.',
@@ -1078,6 +1129,7 @@ export function buildFinalVerifierPrompt(spec, plan, evidence) {
     })}`,
     `final_master_plan_json:\n${safeJson(planPromptSnapshot(plan))}`,
     `bounded_step_evidence_json:\n${safeJson(evidence)}`,
+    ...verifierEvidenceRules(spec),
     'Return exactly one criterion result for every immutable task criterion id, with non-empty evidence for each pass.',
     'Return only the required structured decision.',
   ].join('\n\n')
@@ -1413,24 +1465,48 @@ export async function runMasterPlanPipeline(ctx, spec, signal, logger = ctx.logg
     publishMasterPlanTelemetry(logger, telemetry, spec.taskId, plan)
     const seenStepIds = new Set(plan.steps.map(step => step.id))
 
-    const initialReview = await runPhase(
+    const initialReviewOptions = {
+      transport: spec.lane.transport,
+      label: `${spec.title} / initial plan review`,
+      prompt: buildPlanReviewPrompt(spec, initial.report, 'initial'),
+      parent: spec.parent,
+      signal,
+      timeoutMs: spec.lane.childTimeoutMs,
+      route: spec.lane.planReviewer ?? spec.lane.verifier,
+      tools: spec.lane.verifierTools,
+      outputSchema: PLAN_REVIEW_OUTPUT_SCHEMA,
+      persona: 'You are an independent read-only plan reviewer. Reject scope expansion, weakened acceptance, repeated effects, and infeasible plans.',
+      validate: validatePlanReviewReport,
+      logger,
+    }
+    let initialReview = await runPhase(
       planReviewRuns,
       { attempt: 1, phase: 'initial-plan-review', planRevision: plan.revision },
-      {
-        transport: spec.lane.transport,
-        label: `${spec.title} / initial plan review`,
-        prompt: buildPlanReviewPrompt(spec, initial.report, 'initial'),
-        parent: spec.parent,
-        signal,
-        timeoutMs: spec.lane.childTimeoutMs,
-        route: spec.lane.planReviewer ?? spec.lane.verifier,
-        tools: spec.lane.verifierTools,
-        outputSchema: PLAN_REVIEW_OUTPUT_SCHEMA,
-        persona: 'You are an independent read-only plan reviewer. Reject scope expansion, weakened acceptance, repeated effects, and infeasible plans.',
-        validate: validatePlanReviewReport,
-        logger,
-      },
+      initialReviewOptions,
     )
+    // Same safe retry boundary the initial planner already had: the reviewer is
+    // read-only, so a structured-output miss costs one extra run and no side
+    // effects. Preserve budget for one step/verifier pair and the final verifier.
+    const minimumReviewContinuationRuns = 3
+    if (!initialReview.ok
+      && initialReview.structuredProtocolFailure === true
+      && totalChildRuns + 1 + minimumReviewContinuationRuns <= spec.lane.maxTotalChildRuns
+      && !signal?.aborted) {
+      initialReview = await runPhase(
+        planReviewRuns,
+        { attempt: 2, phase: 'initial-plan-review', planRevision: plan.revision },
+        {
+          ...initialReviewOptions,
+          label: `${spec.title} / initial plan review protocol retry`,
+          prompt: [
+            '[DSH TASK DISPATCHER / STRUCTURED PROTOCOL RETRY]',
+            'The prior read-only plan reviewer ended without calling structured_output.',
+            'Do not emit prose, Markdown, or a code fence. Call structured_output exactly once with the required review.',
+            buildPlanReviewPrompt(spec, initial.report, 'initial'),
+          ].join('\n\n'),
+        },
+      )
+    }
     if (!initialReview.ok) return failureFromChild('initial plan reviewer', initialReview)
     if (initialReview.report.decision !== 'accept') {
       const status = initialReview.report.decision === 'blocked' ? 'blocked' : 'rejected'
@@ -3800,6 +3876,9 @@ export class DispatcherRuntime {
       }
       exec?.signal?.throwIfAborted()
       const spec = parseTaskArgs(raw, this.config, parent, this.createId)
+      // Resolved once per dispatch: which of the lane's tools this deployment
+      // actually mounted. Every prompt and child filter reads it from here.
+      spec.availableToolNames = registeredToolNames(this.ctx)
       if (spec.lane.execution.mode === 'distributed') {
         if (!spec.runInBackground) {
           return {

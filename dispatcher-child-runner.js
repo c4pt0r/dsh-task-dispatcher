@@ -72,9 +72,43 @@ export async function boundedSettlement(promise, timeoutMs) {
   return result
 }
 
-function childToolFilter(toolNames) {
+/**
+ * Tool names this deployment actually registered, or undefined when the
+ * registry cannot be read (never let a diagnostic break a dispatch).
+ * @param ctx - the dispatcher's own context.
+ * @returns the registered names, or undefined.
+ */
+export function registeredToolNames(ctx) {
+  try {
+    const schemas = ctx?.tools?.schemas?.()
+    if (!Array.isArray(schemas)) return undefined
+    return new Set(schemas.map(schema => schema?.name).filter(name => typeof name === 'string'))
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * A lane names the tools its roles SHOULD have; a deployment decides which
+ * plugins are mounted. `tools.restrict()` throws on a name the registry does
+ * not know, so an unmounted optional tool would abort every child instead of
+ * degrading. Drop what is absent, and let the caller tell the model.
+ * @param ctx - the dispatcher's own context.
+ * @param toolNames - the lane's configured names for this role.
+ * @param label - the child label used in the diagnostic.
+ * @param logger - telemetry sink for the dropped-tool warning.
+ * @returns the child tool filter, restricted to names that exist here.
+ */
+function childToolFilter(ctx, toolNames, label, logger) {
   // An explicit empty allow-list is intentional for a model-only verifier.
-  return { allow: toolNames ?? [] }
+  const requested = toolNames ?? []
+  const available = registeredToolNames(ctx)
+  if (available === undefined) return { allow: requested }
+  const missing = requested.filter(name => !available.has(name))
+  if (missing.length > 0) {
+    telemetryWarn(logger, `${label}: this deployment does not provide ${missing.join(', ')}; the child runs without them`)
+  }
+  return { allow: requested.filter(name => available.has(name)) }
 }
 
 function reportChildProgress(options, progress) {
@@ -106,7 +140,7 @@ export async function runStructuredChild(ctx, options) {
       agentOptions: options.route,
       outputSchema: options.outputSchema,
       maxDepth: 1,
-      toolFilter: childToolFilter(options.tools),
+      toolFilter: childToolFilter(ctx, options.tools, options.label, options.logger),
       persona: options.persona,
     }))
     // If startup publishes after our deadline, immediately own and release it.
@@ -165,15 +199,25 @@ export async function runStructuredChild(ctx, options) {
     }
     if (result.stopReason !== 'completed') {
       const partial = contentText(result.output)
+      // A child that finishes its turn without calling structured_output is
+      // reported as stopReason 'error' with no structured value (see
+      // dsh-subagent-in-process-driver). That is a safe retry boundary whether
+      // or not the model left any prose behind: an empty final answer is the
+      // same protocol miss as a prose one, and used to fall through to the
+      // generic 'child run failed' with no retry.
       const structuredProtocolFailure = result.stopReason === 'error'
         && result.structured === undefined
-        && partial !== ''
       return {
         ok: false,
         kind: result.stopReason === 'aborted' ? 'cancelled' : 'error',
         runId: run.id,
         error: structuredProtocolFailure
-          ? `child ended without the required structured result${partial === '' ? '' : `; untrusted plain-text output: ${partial.slice(0, 2_000)}`}`
+          ? partial === ''
+            // No structured result AND no text: could be a protocol miss or a
+            // provider error the subagent seam cannot distinguish. Say what is
+            // observable rather than asserting the cause.
+            ? 'child produced neither the required structured result nor any text'
+            : `child ended without the required structured result; untrusted plain-text output: ${partial.slice(0, 2_000)}`
           : `${stopReasonMessage(result.stopReason)}${partial === '' ? '' : `; partial output: ${partial.slice(0, 2_000)}`}`,
         ...(structuredProtocolFailure ? { structuredProtocolFailure: true } : {}),
       }

@@ -2,13 +2,13 @@
 
 [Documentation index](./README.md) · [Project overview](../README.md) · [简体中文](./zh-CN/examples.md)
 
-Copy-ready examples for local review, foreground decisions, dynamic read-only orchestration, durable distributed tasks, and explicitly authorized write lanes.
+Copy-ready examples for local review, foreground decisions, live web sources, dynamic read-only orchestration, durable distributed tasks, and explicitly authorized write lanes.
 
 
 ## Usage examples
 
 These examples assume they are called from an exact live root Session. The
-first two work with the bundled, read-only `general-analysis` lane. Later
+first three work with the bundled, read-only `general-analysis` lane. Later
 examples name optional lanes that must first be created by an operator in
 **Settings → Plugins → Task Dispatcher**, saved, and activated by restarting
 the DSH Host.
@@ -81,7 +81,39 @@ This returns the foreground task record directly. It may take several model
 runs because the bundled lane plans, reviews, executes, and verifies the work;
 foreground does not mean single-model or unverified.
 
-### Example 3: let a Master Planner expose parallel read-only work
+### Example 3: summarize a live web page
+
+The bundled lane lists `web_fetch` among its executor and verifier tools, so an
+objective may name a URL. Nothing else has to be configured *by the dispatcher*
+— but the tool itself belongs to the host: a deployment that does not mount
+[`dsh-tool-web`](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/web/tool-web)
+with fetch enabled simply runs without it, and the missing name is reported to
+every child in `deployment_capabilities_json.unavailableTools` so the executor
+returns `blocked` instead of inventing a page it never read.
+
+```json
+{
+  "lane": "general-analysis",
+  "title": "Summarize Hacker News front page",
+  "objective": "Fetch the live Hacker News front page at https://news.ycombinator.com/ with web_fetch, list every story visible on it with its rank, title and link, and write a short summary of what the front page is about. Do not modify the workspace. Base every claim only on the fetched page.",
+  "acceptance_criteria": [
+    { "id": "fetch", "text": "The front page was fetched during this task rather than recalled." },
+    { "id": "stories", "text": "Every listed story appears on the fetched page with the rank and link shown there." }
+  ],
+  "run_in_background": false
+}
+```
+
+A live source is the one case where an independent verifier and its executor
+can honestly disagree. The verifier re-fetches the page to check the claim, and
+by then the front page has moved: stories the executor really saw are gone.
+Verifiers are told to treat that as drift rather than fabrication, and to fail
+only for content that could not have come from the source at any time. Drift
+still costs accuracy, so keep the pipeline short for this kind of task —
+`maxPlanSteps: 2` holds the executor's fetch and the final verifier's re-fetch
+minutes apart instead of a quarter hour.
+
+### Example 4: let a Master Planner expose parallel read-only work
 
 After configuring the `analysis-orchestrator` and `analysis-leaf` lanes from
 [Enable a dynamic read-only Master Plan](./configuration.md#enable-a-dynamic-read-only-master-plan),
@@ -120,7 +152,7 @@ Do not put instructions such as “spawn four agents”, “use model X”, or �
 the Worker shell access” in the objective. Those are deployment policy and are
 ignored as authority requests.
 
-### Example 4: inspect or cancel a durable distributed task
+### Example 5: inspect or cancel a durable distributed task
 
 For a lane configured with `execution.mode: distributed`, the task must run in
 the background: set `run_in_background: true` explicitly, or rely on a
@@ -149,7 +181,7 @@ same exact root Session that created the task. They do not inspect or cancel
 local background Jobs, and cancellation is a fenced request rather than an
 immediate process kill.
 
-### Example 5: dispatch a local write task only through an explicit write lane
+### Example 6: dispatch a local write task only through an explicit write lane
 
 The following lane id is illustrative; it is **not** included in the bundled
 configuration. An operator must first create a local `repo-development` lane

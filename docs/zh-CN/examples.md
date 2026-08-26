@@ -2,7 +2,7 @@
 
 [中文文档索引](./README.md) · [返回中文首页](../../README.zh-CN.md) · [English](../examples.md)
 
-所有示例都假定从 exact live root Session 调用。示例 1、2 使用内置 read-only `general-analysis` Lane。其他 Lane 必须先由 operator 在 **Settings → Plugins → Task Dispatcher** 创建、保存，并通过重启 DSH Host 激活。
+所有示例都假定从 exact live root Session 调用。示例 1、2、3 使用内置 read-only `general-analysis` Lane。其他 Lane 必须先由 operator 在 **Settings → Plugins → Task Dispatcher** 创建、保存，并通过重启 DSH Host 激活。
 
 ## 最小 dispatch
 
@@ -80,7 +80,32 @@ caller 需要等待 terminal result 时设置 `run_in_background: false`：
 
 该调用直接返回 foreground task record。内置 Lane 会执行 planning、review、execution 和 verification，可能产生多个 model run；foreground 不表示 single-model 或 unverified。
 
-## 示例 3：并发只读 DAG
+## 示例 3：总结一个实时网页
+
+内置 Lane 的 executor 与 verifier 工具里已经列入 `web_fetch`，所以 objective 可以直接给 URL，**dispatcher 这边不需要额外配置**。但工具本身属于 Host：没有挂载
+[`dsh-tool-web`](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/web/tool-web)
+（且开启 fetch）的部署会自动降级运行，缺失的工具名会写进每个子会话的
+`deployment_capabilities_json.unavailableTools`，让 executor 返回 `blocked`，而不是凭空编造一个它从未读过的页面。
+
+```json
+{
+  "lane": "general-analysis",
+  "title": "总结 Hacker News 首页",
+  "objective": "用 web_fetch 抓取 https://news.ycombinator.com/ 的实时首页，列出页面上可见的每条 story 及其排名、标题与链接，并写一段简短的中文总结。不要修改工作区。所有结论只能基于抓取到的页面。",
+  "acceptance_criteria": [
+    { "id": "fetch", "text": "首页是在本次任务中抓取的，而不是凭记忆回忆的。" },
+    { "id": "stories", "text": "列出的每条 story 都出现在抓取到的页面上，排名与链接与页面一致。" }
+  ],
+  "run_in_background": false
+}
+```
+
+实时数据源是 executor 与独立 verifier 会**诚实地互相矛盾**的唯一情形：verifier 重新抓取页面来核对，而此时首页已经翻动，executor 当初确实看到的条目消失了。
+Verifier 被明确告知要把这种情况当作 drift 而非编造，只有当内容在任何时刻都不可能来自该数据源时才判失败。
+但 drift 仍然会损伤准确度，所以这类任务要把流水线压短 —— `maxPlanSteps: 2`
+能让 executor 的抓取和 final verifier 的复查相隔几分钟，而不是一刻钟。
+
+## 示例 4：并发只读 DAG
 
 先按[配置参考](./configuration.md#启用动态只读-master-plan)创建 `analysis-orchestrator` 与 `analysis-leaf`，再提交包含独立 outcome 的任务：
 
@@ -110,7 +135,7 @@ Web view 显示 root Master Plan、running Worker node、dependencies met、depe
 
 不要在 objective 中写“spawn four agents”“use model X”或“give the Worker shell access”；这些属于 deployment policy。
 
-## 示例 4：查看或取消 durable distributed task
+## 示例 5：查看或取消 durable distributed task
 
 distributed Lane 必须后台运行。initial dispatch 返回 durable `taskId`，不返回 local `jobId`。
 
@@ -133,7 +158,7 @@ dispatch_status({ "task_id": "task-01234567-89ab-cdef-0123-456789abcdef" })
 
 `dispatch_status`/`dispatch_cancel` 在 `distribution.role: coordinator|hybrid` 时注册，并 owner-fence 到创建 task 的 exact root Session。它们不管理 local background Job。详细 lease 语义见[分布式只读执行](./distributed.md)。
 
-## 示例 5：显式 local write Lane
+## 示例 6：显式 local write Lane
 
 以下 `repo-development` 只是说明性 Lane id，内置配置没有它。operator 必须先创建 local Lane、为 Executor 添加 mutation tool、配置 protected `liveRoot`，并以 exact `workspace-write` sandbox 启动 caller：
 
