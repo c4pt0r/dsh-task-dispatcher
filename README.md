@@ -183,6 +183,47 @@ The corresponding tool input is:
 
 Only `lane`, `title`, and `objective` are required. `run_in_background` defaults to the deployment's `defaultRunInBackground`, which is `true` in the bundled profile.
 
+### Work on live web sources
+
+The bundled lane lists `web_fetch` among its executor and verifier tools, so an
+objective may name a URL without any lane editing. The tool itself belongs to
+the Host, not to this plugin: a deployment that does not mount
+[`dsh-tool-web`](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/web/tool-web)
+with fetch enabled runs the same lane without it. Absent tools are dropped from
+the child rather than aborting it, and are named in
+`deployment_capabilities_json.unavailableTools` so an executor returns `blocked`
+instead of inventing a page it never read.
+
+The DSH `web` profile ships `tool-web` disabled. To enable fetch there, add a
+fetch provider to the profile and re-enable the row in its `cordis.patch.yml`:
+
+```sh
+pnpm dsh plugin --profile web add @deepseek-ai/dsh-web-fetch-http
+```
+
+```yaml
+- id: tool-web
+  disabled: false
+  config:
+    search: false   # `web_search` needs a search provider and its credential
+    fetch: true
+
+- insert:
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+```
+
+Restart the Host afterwards. See
+[Example 3](./docs/examples.md#example-3-summarize-a-live-web-page).
+
+A live source is the one case where an executor and its independent verifier
+can honestly disagree: the verifier re-fetches the page to check the claim, and
+by then the page has moved. Verifiers are told to treat that as drift rather
+than fabrication, and to fail only for content that could not have come from
+the source at any time. Drift still costs accuracy, so keep the pipeline short
+for this kind of task — `maxPlanSteps: 2` holds the executor's fetch and the
+final verifier's re-fetch minutes apart instead of a quarter hour.
+
 ### Follow or cancel the task
 
 | Dispatch kind | Initial identity | Inspect progress/result | Cancel |

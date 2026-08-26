@@ -158,6 +158,42 @@ accepted 表示 model-verified，不代表形式化证明、安全认证或 huma
 
 caller 可以添加更严格 criterion，但不能移除 Lane mandatory criterion。
 
+### 处理实时网页
+
+内置 Lane 的 executor 与 verifier 工具里已列入 `web_fetch`，objective 可以直接给
+URL，不需要改 Lane 配置。但工具本身属于 Host 而非本插件：没有挂载
+[`dsh-tool-web`](https://github.com/deepseek-ai/deepseek-harness/tree/main/packages/web/tool-web)
+（且开启 fetch）的部署会照常运行同一个 Lane，只是没有这个工具。缺失的工具会从子会话里剔除而不是让它中止，并写进
+`deployment_capabilities_json.unavailableTools`，让 executor 返回 `blocked`，而不是编造一个它从未读过的页面。
+
+DSH 的 `web` profile 出厂时 `tool-web` 是关闭的。要在那里开启 fetch，给 profile
+添加一个 fetch provider，并在它的 `cordis.patch.yml` 里重新启用该行：
+
+```sh
+pnpm dsh plugin --profile web add @deepseek-ai/dsh-web-fetch-http
+```
+
+```yaml
+- id: tool-web
+  disabled: false
+  config:
+    search: false   # `web_search` 需要搜索 provider 及其凭证
+    fetch: true
+
+- insert:
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+```
+
+改完重启 Host。参见
+[示例 3](./docs/zh-CN/examples.md#示例-3总结一个实时网页)。
+
+实时数据源是 executor 与独立 verifier 会**诚实地互相矛盾**的唯一情形：verifier
+重新抓取页面来核对，而此时页面已经变了。Verifier 被明确告知要把这种情况当作
+drift 而非编造，只有当内容在任何时刻都不可能来自该数据源时才判失败。但 drift
+仍然会损伤准确度，所以这类任务要把流水线压短 —— `maxPlanSteps: 2` 能让 executor
+的抓取和 final verifier 的复查相隔几分钟，而不是一刻钟。
+
 ### 跟踪与取消
 
 | Dispatch kind | Identity | 查看 | 取消 |
