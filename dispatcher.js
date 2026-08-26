@@ -3878,7 +3878,7 @@ export class DispatcherRuntime {
       const spec = parseTaskArgs(raw, this.config, parent, this.createId)
       // Resolved once per dispatch: which of the lane's tools this deployment
       // actually mounted. Every prompt and child filter reads it from here.
-      spec.availableToolNames = registeredToolNames(this.ctx)
+      spec.availableToolNames = registeredToolNames(this.ctx, parent)
       if (spec.lane.execution.mode === 'distributed') {
         if (!spec.runInBackground) {
           return {

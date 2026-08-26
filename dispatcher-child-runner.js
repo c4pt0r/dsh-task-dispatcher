@@ -78,14 +78,29 @@ export async function boundedSettlement(promise, timeoutMs) {
  * @param ctx - the dispatcher's own context.
  * @returns the registered names, or undefined.
  */
-export function registeredToolNames(ctx) {
-  try {
-    const schemas = ctx?.tools?.schemas?.()
-    if (!Array.isArray(schemas)) return undefined
-    return new Set(schemas.map(schema => schema?.name).filter(name => typeof name === 'string'))
-  } catch {
-    return undefined
+export function registeredToolNames(ctx, scope) {
+  // Union of the agent-scoped and global views on purpose. A deployment may
+  // register a tool globally (headless) or scope it to the agent (the web app
+  // scopes the fs tools to a session's workspace), and a child inherits from
+  // BOTH chains. Consulting only the plugin's own unscoped view reports every
+  // agent-scoped tool as missing and silently strips read/glob/grep. Dropping
+  // a tool is only safe when neither view has heard of it.
+  const names = new Set()
+  let answered = false
+  for (const key of [scope, undefined]) {
+    let schemas
+    try {
+      schemas = ctx?.tools?.schemas?.(key)
+    } catch {
+      continue
+    }
+    if (!Array.isArray(schemas)) continue
+    answered = true
+    for (const schema of schemas) {
+      if (typeof schema?.name === 'string') names.add(schema.name)
+    }
   }
+  return answered ? names : undefined
 }
 
 /**
@@ -99,10 +114,10 @@ export function registeredToolNames(ctx) {
  * @param logger - telemetry sink for the dropped-tool warning.
  * @returns the child tool filter, restricted to names that exist here.
  */
-function childToolFilter(ctx, toolNames, label, logger) {
+function childToolFilter(ctx, toolNames, label, logger, scope) {
   // An explicit empty allow-list is intentional for a model-only verifier.
   const requested = toolNames ?? []
-  const available = registeredToolNames(ctx)
+  const available = registeredToolNames(ctx, scope)
   if (available === undefined) return { allow: requested }
   const missing = requested.filter(name => !available.has(name))
   if (missing.length > 0) {
@@ -140,7 +155,7 @@ export async function runStructuredChild(ctx, options) {
       agentOptions: options.route,
       outputSchema: options.outputSchema,
       maxDepth: 1,
-      toolFilter: childToolFilter(ctx, options.tools, options.label, options.logger),
+      toolFilter: childToolFilter(ctx, options.tools, options.label, options.logger, options.parent),
       persona: options.persona,
     }))
     // If startup publishes after our deadline, immediately own and release it.
