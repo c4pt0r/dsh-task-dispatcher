@@ -26,6 +26,10 @@ const t: TaskDispatcherSettingsTabProps['t'] = (key, params = {}) => {
   return value
 }
 
+function overrideLabel(role: 'planReviewer' | 'replanner' | 'finalVerifier'): string {
+  return t('settings.route.override', { role: t(`settings.route.${role}`) })
+}
+
 function readyState(): DispatcherConfigViewState {
   const snapshot = configSnapshot()
   return {
@@ -69,6 +73,155 @@ describe('TaskDispatcherSettingsTab', () => {
     expect(env.type).toBe('text')
     expect(env.value).toBe('DSH_DISPATCHER_DATABASE_URL')
     expect(document.body.textContent).not.toContain('postgres://')
+  })
+
+  it('shows all six role models, their fallbacks, and the parent-to-child lane boundary', () => {
+    const state = readyState()
+    state.draft!.lanes.analysis!.orchestration.enabled = true
+    state.draft!.lanes.analysis!.orchestration.childLane = 'leaf'
+    renderState(state)
+    fireEvent.click(screen.getByText('Analysis · analysis'))
+
+    for (const key of ['planner', 'planReviewer', 'replanner', 'executor', 'verifier', 'finalVerifier'] as const) {
+      expect(screen.getByRole('group', { name: t(`settings.route.${key}`) })).toBeTruthy()
+    }
+    const planReview = screen.getByRole('group', { name: t('settings.route.planReviewer') })
+    expect(within(planReview).getByText('deepseek/verifier')).toBeTruthy()
+    expect(within(planReview).getByText(t('settings.route.inherits', { role: t('settings.route.verifier') }))).toBeTruthy()
+    const replan = screen.getByRole('group', { name: t('settings.route.replanner') })
+    expect(within(replan).getByText('deepseek/planner')).toBeTruthy()
+    const executor = screen.getByRole('group', { name: t('settings.route.executor') })
+    expect(within(executor).getByText(t('settings.route.orchestrationExecutorDescription'))).toBeTruthy()
+    const verifier = screen.getByRole('group', { name: t('settings.route.verifier') })
+    expect(within(verifier).getByText(t('settings.route.orchestrationVerifierDescription'))).toBeTruthy()
+    expect(screen.getByText(t('settings.lane.parentModels', { lane: 'analysis' }))).toBeTruthy()
+    expect(screen.getByText(t('settings.lane.childModels', { lane: 'leaf' }))).toBeTruthy()
+  })
+
+  it('stages each role override from its documented fallback without changing sibling routes', () => {
+    const controller = renderState(readyState())
+    fireEvent.click(screen.getByText('Analysis · analysis'))
+
+    for (const role of ['planReviewer', 'replanner', 'finalVerifier'] as const) {
+      const card = screen.getByRole('group', { name: t(`settings.route.${role}`) })
+      fireEvent.click(within(card).getByLabelText(overrideLabel(role)))
+    }
+    expect(controller.edit).toHaveBeenCalledTimes(3)
+
+    const expected = {
+      planReviewer: 'verifier',
+      replanner: 'planner',
+      finalVerifier: 'verifier',
+    } as const
+    for (const [index, role] of (['planReviewer', 'replanner', 'finalVerifier'] as const).entries()) {
+      const candidate = configFixture()
+      const update = controller.edit.mock.calls[index]?.[0] as (draft: typeof candidate) => void
+      update(candidate)
+      expect(candidate.lanes.analysis?.[role]?.model).toBe(expected[role])
+      for (const sibling of ['planReviewer', 'replanner', 'finalVerifier'] as const) {
+        if (sibling !== role) expect(candidate.lanes.analysis?.[sibling]).toBeUndefined()
+      }
+    }
+  })
+
+  it('writes each of the six model fields to its own route', () => {
+    const state = readyState()
+    const lane = state.draft!.lanes.analysis!
+    lane.planReviewer = { provider: 'deepseek', model: 'plan-review', maxTokens: 8_000 }
+    lane.replanner = { provider: 'deepseek', model: 'replan', maxTokens: 9_000 }
+    lane.finalVerifier = { provider: 'deepseek', model: 'final-review', maxTokens: 10_000 }
+    const controller = renderState(state)
+    fireEvent.click(screen.getByText('Analysis · analysis'))
+    const roles = ['planner', 'planReviewer', 'replanner', 'executor', 'verifier', 'finalVerifier'] as const
+
+    for (const role of roles) {
+      const card = screen.getByRole('group', { name: t(`settings.route.${role}`) })
+      fireEvent.change(within(card).getByLabelText(t('settings.route.model')), {
+        target: { value: `${role}-next` },
+      })
+    }
+    expect(controller.edit).toHaveBeenCalledTimes(roles.length)
+
+    for (const [index, role] of roles.entries()) {
+      const candidate = configFixture()
+      candidate.lanes.analysis!.planReviewer = { provider: 'deepseek', model: 'plan-review', maxTokens: 8_000 }
+      candidate.lanes.analysis!.replanner = { provider: 'deepseek', model: 'replan', maxTokens: 9_000 }
+      candidate.lanes.analysis!.finalVerifier = { provider: 'deepseek', model: 'final-review', maxTokens: 10_000 }
+      const before = Object.fromEntries(roles.map(key => [key, candidate.lanes.analysis?.[key]?.model]))
+      const update = controller.edit.mock.calls[index]?.[0] as (draft: typeof candidate) => void
+      update(candidate)
+      expect(candidate.lanes.analysis?.[role]?.model).toBe(`${role}-next`)
+      for (const sibling of roles) {
+        if (sibling !== role) expect(candidate.lanes.analysis?.[sibling]?.model).toBe(before[sibling])
+      }
+    }
+  })
+
+  it('lets built-in role overrides be edited but not returned to inheritance', () => {
+    const state = readyState()
+    const routes = {
+      planReviewer: { provider: 'review', model: 'plan-review', maxTokens: 8_000 },
+      replanner: { provider: 'planning', model: 'replan', maxTokens: 9_000 },
+      finalVerifier: { provider: 'review', model: 'final-review', maxTokens: 10_000 },
+    }
+    for (const [role, route] of Object.entries(routes) as Array<[keyof typeof routes, typeof routes.planReviewer]>) {
+      state.snapshot!.base.lanes.analysis![role] = structuredClone(route)
+      state.snapshot!.value.lanes.analysis![role] = structuredClone(route)
+      state.draft!.lanes.analysis![role] = structuredClone(route)
+    }
+    renderState(state)
+    fireEvent.click(screen.getByText('Analysis · analysis'))
+
+    for (const role of ['planReviewer', 'replanner', 'finalVerifier'] as const) {
+      const card = screen.getByRole('group', { name: t(`settings.route.${role}`) })
+      expect((within(card).getByLabelText(overrideLabel(role)) as HTMLInputElement).disabled).toBe(true)
+      expect((within(card).getByLabelText(t('settings.route.model')) as HTMLInputElement).disabled).toBe(false)
+    }
+  })
+
+  it('returns an optional role to inheritance without removing the master plan', () => {
+    const state = readyState()
+    state.draft!.lanes.analysis!.planReviewer = {
+      provider: 'review', model: 'plan-review', maxTokens: 8_000,
+    }
+    const controller = renderState(state)
+    fireEvent.click(screen.getByText('Analysis · analysis'))
+    const card = screen.getByRole('group', { name: t('settings.route.planReviewer') })
+    fireEvent.click(within(card).getByLabelText(overrideLabel('planReviewer')))
+
+    const candidate = configFixture()
+    candidate.lanes.analysis!.planReviewer = {
+      provider: 'review', model: 'plan-review', maxTokens: 8_000,
+    }
+    const update = controller.edit.mock.calls[0]?.[0] as (draft: typeof candidate) => void
+    update(candidate)
+    expect(candidate.lanes.analysis?.planner?.model).toBe('planner')
+    expect(candidate.lanes.analysis?.planReviewer).toBeUndefined()
+  })
+
+  it('turning off a custom planner atomically removes every planning-role override', () => {
+    const state = readyState()
+    const custom = structuredClone(state.draft!.lanes.analysis!)
+    custom.planReviewer = { provider: 'review', model: 'plan-review', maxTokens: 8_000 }
+    custom.replanner = { provider: 'planning', model: 'replan', maxTokens: 9_000 }
+    custom.finalVerifier = { provider: 'review', model: 'final-review', maxTokens: 10_000 }
+    state.draft!.lanes.custom = custom
+    state.snapshot!.value.lanes.custom = structuredClone(custom)
+    const controller = renderState(state)
+    const summary = screen.getByText('Analysis · custom')
+    fireEvent.click(summary)
+    const customCard = summary.closest('details')!
+    fireEvent.click(within(customCard).getByLabelText(t('settings.route.plannerEnabled')))
+
+    const candidate = configFixture()
+    candidate.lanes.custom = structuredClone(custom)
+    const update = controller.edit.mock.calls[0]?.[0] as (draft: typeof candidate) => void
+    update(candidate)
+    expect(candidate.lanes.custom).toMatchObject({ executor: { model: 'executor' }, verifier: { model: 'verifier' } })
+    expect(candidate.lanes.custom?.planner).toBeUndefined()
+    expect(candidate.lanes.custom?.planReviewer).toBeUndefined()
+    expect(candidate.lanes.custom?.replanner).toBeUndefined()
+    expect(candidate.lanes.custom?.finalVerifier).toBeUndefined()
   })
 
   it('locks composition-owned planners and mapping identities before Host validation', () => {

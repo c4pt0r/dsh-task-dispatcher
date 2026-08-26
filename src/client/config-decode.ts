@@ -83,6 +83,7 @@ function lane(value: unknown, path: string): DispatcherLaneConfig {
   const source = record(value, path)
   exact(source, [
     'name', 'description', 'kind', 'transport', 'execution', 'orchestration', 'executor', 'verifier', 'planner',
+    'planReviewer', 'replanner', 'finalVerifier',
     'plannerTools', 'maxPlanSteps', 'maxPlanPatches', 'maxTotalChildRuns', 'taskTimeoutMs',
     'retryOnRevise', 'maxAttempts', 'childTimeoutMs', 'requiredCriteria', 'executorTools',
     'verifierTools',
@@ -96,6 +97,9 @@ function lane(value: unknown, path: string): DispatcherLaneConfig {
     'failureMode',
   ], `${path}.orchestration`)
   const planner = source['planner']
+  const planReviewer = source['planReviewer']
+  const replanner = source['replanner']
+  const finalVerifier = source['finalVerifier']
   const executorTools = source['executorTools']
   return {
     name: string(source['name'], `${path}.name`),
@@ -130,6 +134,9 @@ function lane(value: unknown, path: string): DispatcherLaneConfig {
     executor: route(source['executor'], `${path}.executor`),
     verifier: route(source['verifier'], `${path}.verifier`),
     ...(planner === undefined ? {} : { planner: route(planner, `${path}.planner`) }),
+    ...(planReviewer === undefined ? {} : { planReviewer: route(planReviewer, `${path}.planReviewer`) }),
+    ...(replanner === undefined ? {} : { replanner: route(replanner, `${path}.replanner`) }),
+    ...(finalVerifier === undefined ? {} : { finalVerifier: route(finalVerifier, `${path}.finalVerifier`) }),
     plannerTools: strings(source['plannerTools'], `${path}.plannerTools`),
     maxPlanSteps: integer(source['maxPlanSteps'], `${path}.maxPlanSteps`),
     maxPlanPatches: integer(source['maxPlanPatches'], `${path}.maxPlanPatches`),
@@ -200,7 +207,7 @@ export function decodeDispatcherConfigSnapshot(value: unknown): DispatcherConfig
     'protocolVersion', 'available', 'writable', 'applies', 'revision', 'value', 'base',
     'userLaneIds', 'invalid',
   ], '$')
-  if (source['protocolVersion'] !== 1) fail('$.protocolVersion', '1')
+  if (source['protocolVersion'] !== 2) fail('$.protocolVersion', '2')
   if (source['applies'] !== 'restart') fail('$.applies', 'restart')
   const invalid = source['invalid']
   const base = config(source['base'], '$.base')
@@ -212,7 +219,7 @@ export function decodeDispatcherConfigSnapshot(value: unknown): DispatcherConfig
     resolved = structuredClone(base)
   }
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     available: boolean(source['available'], '$.available'),
     revision: integer(source['revision'], '$.revision'),
     writable: boolean(source['writable'], '$.writable'),

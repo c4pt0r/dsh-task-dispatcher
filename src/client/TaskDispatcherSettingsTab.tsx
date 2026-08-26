@@ -174,9 +174,17 @@ function parseList(value: string): string[] {
   return value.split(/[\s,]+/u).map(item => item.trim()).filter(Boolean)
 }
 
-function RouteEditor(props: {
+function routeLabel(route: DispatcherRouteConfig): string {
+  const provider = route.provider.trim()
+  const model = route.model.trim()
+  if (provider === '' && model === '') return '—'
+  if (provider === '') return model
+  if (model === '') return provider
+  return `${provider}/${model}`
+}
+
+function RouteFields(props: {
   id: string
-  title: string
   route: DispatcherRouteConfig
   path: string
   disabled: boolean
@@ -185,40 +193,112 @@ function RouteEditor(props: {
   onChange: (update: (route: DispatcherRouteConfig) => void) => void
 }) {
   return (
-    <fieldset className={css.route}>
-      <legend>{props.title}</legend>
-      <div className={css.grid3}>
-        <TextField
-          id={`${props.id}-provider`}
-          label={props.t('settings.route.provider')}
-          hint={props.t('settings.route.providerHint')}
-          value={props.route.provider}
-          disabled={props.disabled}
-          error={props.error(`${props.path}.provider`)}
-          onChange={value => { props.onChange(route => { route.provider = value }) }}
-        />
-        <TextField
-          id={`${props.id}-model`}
-          label={props.t('settings.route.model')}
-          hint={props.t('settings.route.modelHint')}
-          value={props.route.model}
-          disabled={props.disabled}
-          error={props.error(`${props.path}.model`)}
-          onChange={value => { props.onChange(route => { route.model = value }) }}
-        />
-        <NumberField
-          id={`${props.id}-tokens`}
-          label={props.t('settings.route.maxTokens')}
-          hint={props.t('settings.route.maxTokensHint')}
-          value={props.route.maxTokens}
-          min={1}
-          max={1_000_000}
-          disabled={props.disabled}
-          error={props.error(`${props.path}.maxTokens`)}
-          onChange={value => { props.onChange(route => { route.maxTokens = value }) }}
-        />
+    <div className={css.grid3}>
+      <TextField
+        id={`${props.id}-provider`}
+        label={props.t('settings.route.provider')}
+        hint={props.t('settings.route.providerHint')}
+        value={props.route.provider}
+        disabled={props.disabled}
+        error={props.error(`${props.path}.provider`)}
+        onChange={value => { props.onChange(route => { route.provider = value }) }}
+      />
+      <TextField
+        id={`${props.id}-model`}
+        label={props.t('settings.route.model')}
+        hint={props.t('settings.route.modelHint')}
+        value={props.route.model}
+        disabled={props.disabled}
+        error={props.error(`${props.path}.model`)}
+        onChange={value => { props.onChange(route => { route.model = value }) }}
+      />
+      <NumberField
+        id={`${props.id}-tokens`}
+        label={props.t('settings.route.maxTokens')}
+        hint={props.t('settings.route.maxTokensHint')}
+        value={props.route.maxTokens}
+        min={1}
+        max={1_000_000}
+        disabled={props.disabled}
+        error={props.error(`${props.path}.maxTokens`)}
+        onChange={value => { props.onChange(route => { route.maxTokens = value }) }}
+      />
+    </div>
+  )
+}
+
+function RoleRouteCard(props: {
+  id: string
+  title: string
+  description: string
+  route?: DispatcherRouteConfig
+  path: string
+  disabled: boolean
+  inactive?: boolean
+  override?: {
+    checked: boolean
+    locked: boolean
+    inheritsFrom: string
+    onChange: (checked: boolean) => void
+  }
+  t: Translate
+  error: (path: string) => string | undefined
+  onChange: (update: (route: DispatcherRouteConfig) => void) => void
+}) {
+  const headingId = `${props.id}-heading`
+  const inherited = props.override !== undefined && !props.override.checked
+  return (
+    <section
+      className={css.roleCard}
+      role="group"
+      aria-labelledby={headingId}
+      data-inactive={props.inactive ? 'true' : undefined}
+      data-inherited={inherited ? 'true' : undefined}
+    >
+      <div className={css.roleHead}>
+        <div>
+          <h5 id={headingId}>{props.title}</h5>
+          <p>{props.description}</p>
+        </div>
+        {props.inactive
+          ? <Pill>{props.t('settings.route.inactive')}</Pill>
+          : inherited
+            ? <Pill>{props.t('settings.route.inherits', { role: props.override!.inheritsFrom })}</Pill>
+            : null}
       </div>
-    </fieldset>
+      {props.override === undefined ? null : (
+        <CheckField
+          id={`${props.id}-override`}
+          label={props.t('settings.route.override', { role: props.title })}
+          hint={props.t(props.inactive
+            ? 'settings.route.overrideUnavailableHint'
+            : props.override.locked
+              ? 'settings.route.overrideRequiredHint'
+              : 'settings.route.overrideHint', { role: props.override.inheritsFrom })}
+          checked={props.override.checked}
+          disabled={props.disabled || props.inactive === true || props.override.locked}
+          onChange={props.override.onChange}
+        />
+      )}
+      {props.inactive ? (
+        <p className={css.roleState}>{props.t('settings.route.inactiveHint')}</p>
+      ) : inherited && props.route !== undefined ? (
+        <div className={css.inheritedRoute}>
+          <span>{props.t('settings.route.effectiveModel')}</span>
+          <strong>{routeLabel(props.route)}</strong>
+        </div>
+      ) : props.route === undefined ? null : (
+        <RouteFields
+          id={props.id}
+          route={props.route}
+          path={props.path}
+          disabled={props.disabled}
+          t={props.t}
+          error={props.error}
+          onChange={props.onChange}
+        />
+      )}
+    </section>
   )
 }
 
@@ -240,10 +320,24 @@ function LaneEditor(props: {
   const uid = useId()
   const root = `lanes.${props.id}`
   const error = (path: string) => validationText(props.t, props.errors[path])
-  const setRoute = (key: 'executor' | 'verifier' | 'planner', update: (route: DispatcherRouteConfig) => void) => {
+  const setRoute = (
+    key: 'planner' | 'planReviewer' | 'executor' | 'verifier' | 'replanner' | 'finalVerifier',
+    update: (route: DispatcherRouteConfig) => void,
+  ) => {
     props.edit((lane) => {
       const target = lane[key]
       if (target !== undefined) update(target)
+    })
+  }
+  const setOverride = (key: 'planReviewer' | 'replanner' | 'finalVerifier', checked: boolean) => {
+    props.edit((lane) => {
+      if (!checked) {
+        delete lane[key]
+        return
+      }
+      if (lane.planner === undefined) return
+      const fallback = key === 'replanner' ? lane.planner : lane.verifier
+      lane[key] = { ...fallback }
     })
   }
   const editCriterion = (index: number, update: (criterion: DispatcherCriterionConfig) => void) => {
@@ -297,27 +391,16 @@ function LaneEditor(props: {
           />
         </div>
 
-        <h4>{props.t('settings.lane.models')}</h4>
-        <RouteEditor
-          id={`${uid}-executor`}
-          title={props.t('settings.route.executor')}
-          route={props.lane.executor}
-          path={`${root}.executor`}
-          disabled={props.disabled}
-          t={props.t}
-          error={error}
-          onChange={update => { setRoute('executor', update) }}
-        />
-        <RouteEditor
-          id={`${uid}-verifier`}
-          title={props.t('settings.route.verifier')}
-          route={props.lane.verifier}
-          path={`${root}.verifier`}
-          disabled={props.disabled}
-          t={props.t}
-          error={error}
-          onChange={update => { setRoute('verifier', update) }}
-        />
+        <div className={css.modelsHead}>
+          <h4>{props.t('settings.lane.models')}</h4>
+          <p>{props.t('settings.lane.modelsIntro')}</p>
+        </div>
+        <div className={css.modelScope}>
+          <strong>{props.t('settings.lane.parentModels', { lane: props.id })}</strong>
+          <p>{props.lane.orchestration.enabled && props.lane.orchestration.childLane !== ''
+            ? props.t('settings.lane.childModels', { lane: props.lane.orchestration.childLane })
+            : props.t('settings.lane.childModelsHint')}</p>
+        </div>
         <CheckField
           id={`${uid}-planner-enabled`}
           label={props.t('settings.route.plannerEnabled')}
@@ -329,22 +412,109 @@ function LaneEditor(props: {
           onChange={(checked) => {
             props.edit((lane) => {
               if (checked) lane.planner = { provider: lane.verifier.provider, model: lane.verifier.model, maxTokens: lane.verifier.maxTokens }
-              else delete lane.planner
+              else {
+                delete lane.planner
+                delete lane.planReviewer
+                delete lane.replanner
+                delete lane.finalVerifier
+              }
             })
           }}
         />
-        {props.lane.planner === undefined ? null : (
-          <RouteEditor
+        <div className={css.roleGrid}>
+          <RoleRouteCard
             id={`${uid}-planner`}
             title={props.t('settings.route.planner')}
+            description={props.t('settings.route.plannerDescription')}
             route={props.lane.planner}
             path={`${root}.planner`}
             disabled={props.disabled}
+            inactive={props.lane.planner === undefined}
             t={props.t}
             error={error}
             onChange={update => { setRoute('planner', update) }}
           />
-        )}
+          <RoleRouteCard
+            id={`${uid}-plan-reviewer`}
+            title={props.t('settings.route.planReviewer')}
+            description={props.t('settings.route.planReviewerDescription')}
+            route={props.lane.planReviewer ?? props.lane.verifier}
+            path={`${root}.planReviewer`}
+            disabled={props.disabled}
+            inactive={props.lane.planner === undefined}
+            override={{
+              checked: props.lane.planReviewer !== undefined,
+              locked: props.baseLane?.planReviewer !== undefined,
+              inheritsFrom: props.t('settings.route.verifier'),
+              onChange: checked => { setOverride('planReviewer', checked) },
+            }}
+            t={props.t}
+            error={error}
+            onChange={update => { setRoute('planReviewer', update) }}
+          />
+          <RoleRouteCard
+            id={`${uid}-replanner`}
+            title={props.t('settings.route.replanner')}
+            description={props.t('settings.route.replannerDescription')}
+            route={props.lane.replanner ?? props.lane.planner}
+            path={`${root}.replanner`}
+            disabled={props.disabled}
+            inactive={props.lane.planner === undefined}
+            override={{
+              checked: props.lane.replanner !== undefined,
+              locked: props.baseLane?.replanner !== undefined,
+              inheritsFrom: props.t('settings.route.planner'),
+              onChange: checked => { setOverride('replanner', checked) },
+            }}
+            t={props.t}
+            error={error}
+            onChange={update => { setRoute('replanner', update) }}
+          />
+          <RoleRouteCard
+            id={`${uid}-executor`}
+            title={props.t('settings.route.executor')}
+            description={props.t(props.lane.orchestration.enabled
+              ? 'settings.route.orchestrationExecutorDescription'
+              : 'settings.route.executorDescription')}
+            route={props.lane.executor}
+            path={`${root}.executor`}
+            disabled={props.disabled}
+            t={props.t}
+            error={error}
+            onChange={update => { setRoute('executor', update) }}
+          />
+          <RoleRouteCard
+            id={`${uid}-verifier`}
+            title={props.t('settings.route.verifier')}
+            description={props.t(props.lane.orchestration.enabled
+              ? 'settings.route.orchestrationVerifierDescription'
+              : 'settings.route.verifierDescription')}
+            route={props.lane.verifier}
+            path={`${root}.verifier`}
+            disabled={props.disabled}
+            t={props.t}
+            error={error}
+            onChange={update => { setRoute('verifier', update) }}
+          />
+          <RoleRouteCard
+            id={`${uid}-final-verifier`}
+            title={props.t('settings.route.finalVerifier')}
+            description={props.t('settings.route.finalVerifierDescription')}
+            route={props.lane.finalVerifier ?? props.lane.verifier}
+            path={`${root}.finalVerifier`}
+            disabled={props.disabled}
+            inactive={props.lane.planner === undefined}
+            override={{
+              checked: props.lane.finalVerifier !== undefined,
+              locked: props.baseLane?.finalVerifier !== undefined,
+              inheritsFrom: props.t('settings.route.verifier'),
+              onChange: checked => { setOverride('finalVerifier', checked) },
+            }}
+            t={props.t}
+            error={error}
+            onChange={update => { setRoute('finalVerifier', update) }}
+          />
+        </div>
 
         <h4>{props.t('settings.lane.execution')}</h4>
         <div className={css.grid3}>

@@ -58,7 +58,8 @@
     "lib/client.js.map",
     "lib/package.json",
     "LICENSE",
-    "README.md"
+    "README.md",
+    "README.zh-CN.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"

@@ -58,6 +58,9 @@ export interface DispatcherLaneConfig {
   executor: DispatcherRouteConfig
   verifier: DispatcherRouteConfig
   planner?: DispatcherRouteConfig
+  planReviewer?: DispatcherRouteConfig
+  replanner?: DispatcherRouteConfig
+  finalVerifier?: DispatcherRouteConfig
   plannerTools: string[]
   maxPlanSteps: number
   maxPlanPatches: number
@@ -99,7 +102,7 @@ export interface DispatcherPolicyConfig {
 }
 
 export interface DispatcherConfigSnapshot {
-  protocolVersion: 1
+  protocolVersion: 2
   available: boolean
   revision: number
   writable: boolean

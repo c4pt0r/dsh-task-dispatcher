@@ -63,7 +63,7 @@ export function configFixture(): DispatcherPolicyConfig {
 export function configSnapshot(revision = 1): DispatcherConfigSnapshot {
   const base = configFixture()
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     available: true,
     writable: true,
     applies: 'restart',

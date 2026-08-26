@@ -26,7 +26,7 @@ export type DispatcherValidationCode =
   | 'required' | 'trimmed' | 'invalid-id' | 'invalid-env' | 'range' | 'duplicate'
   | 'absolute-path' | 'criteria-required' | 'read-only-tools' | 'distribution-required'
   | 'mapping-required' | 'heartbeat' | 'max-lanes' | 'overlap' | 'invalid-config'
-  | 'unsafe-tool' | 'orchestration'
+  | 'unsafe-tool' | 'orchestration' | 'planning-required'
 
 export type DispatcherValidationErrors = Record<string, DispatcherValidationCode>
 
@@ -138,6 +138,14 @@ export function validateDispatcherDraft(config: DispatcherPolicyConfig): Dispatc
     route(errors, `${root}.executor`, lane.executor)
     route(errors, `${root}.verifier`, lane.verifier)
     if (lane.planner !== undefined) route(errors, `${root}.planner`, lane.planner)
+    if (lane.planReviewer !== undefined) route(errors, `${root}.planReviewer`, lane.planReviewer)
+    if (lane.replanner !== undefined) route(errors, `${root}.replanner`, lane.replanner)
+    if (lane.finalVerifier !== undefined) route(errors, `${root}.finalVerifier`, lane.finalVerifier)
+    if (lane.planner === undefined) {
+      for (const role of ['planReviewer', 'replanner', 'finalVerifier'] as const) {
+        if (lane[role] !== undefined) errors[`${root}.${role}`] = 'planning-required'
+      }
+    }
     tools(errors, `${root}.executorTools`, lane.executorTools)
     tools(errors, `${root}.plannerTools`, lane.plannerTools)
     tools(errors, `${root}.verifierTools`, lane.verifierTools)

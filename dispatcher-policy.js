@@ -64,7 +64,7 @@ const RAW_DELEGATION_TOOLS = new Set([
 /** Restart-scoped policy configuration uses its own loopback-only RPC. */
 export const TASK_DISPATCHER_CONFIG_RPC_CHANNEL = '/task-dispatcher-config'
 export const TASK_DISPATCHER_SETTINGS_NAMESPACE = 'dsh-task-dispatcher'
-export const TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION = 1
+export const TASK_DISPATCHER_CONFIG_PROTOCOL_VERSION = 2
 
 const CONFIG_RPC_MAX_BYTES = 1_048_576
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/u
@@ -109,6 +109,9 @@ const Lane = z.object({
   executor: Route.required(),
   verifier: Route.required(),
   planner: z.any().default(undefined),
+  planReviewer: z.any().default(undefined),
+  replanner: z.any().default(undefined),
+  finalVerifier: z.any().default(undefined),
   plannerTools: z.array(z.string().max(128)).max(MAX_TOOL_NAMES).default([]),
   maxPlanSteps: z.natural().min(1).max(MAX_PLAN_STEPS).default(6),
   maxPlanPatches: z.natural().min(0).max(MAX_PLAN_PATCHES).default(4),
@@ -267,6 +270,17 @@ export function validateDispatcherConfig(config) {
     if (lane.planner !== undefined) {
       lane.planner = Route(lane.planner)
       validateRoute(lane.planner, `dsh-task-dispatcher: lane ${id}.planner`)
+    }
+    for (const role of ['planReviewer', 'replanner', 'finalVerifier']) {
+      if (lane[role] === undefined) continue
+      lane[role] = Route(lane[role])
+      validateRoute(lane[role], `dsh-task-dispatcher: lane ${id}.${role}`)
+    }
+    if (lane.planner === undefined
+      && [lane.planReviewer, lane.replanner, lane.finalVerifier].some(route => route !== undefined)) {
+      throw new TypeError(
+        `dsh-task-dispatcher: lane ${id} role-specific planning routes require a planner`,
+      )
     }
     validateToolNames(lane.executorTools, `dsh-task-dispatcher: lane ${id}.executorTools`)
     validateToolNames(lane.verifierTools, `dsh-task-dispatcher: lane ${id}.verifierTools`)
@@ -428,7 +442,8 @@ const DISTRIBUTION_CONFIG_KEYS = new Set([
 const LANE_CONFIG_KEYS = new Set([
   'name', 'description', 'kind', 'transport', 'execution', 'executor', 'verifier',
   'orchestration',
-  'planner', 'plannerTools', 'maxPlanSteps', 'maxPlanPatches', 'maxTotalChildRuns',
+  'planner', 'planReviewer', 'replanner', 'finalVerifier',
+  'plannerTools', 'maxPlanSteps', 'maxPlanPatches', 'maxTotalChildRuns',
   'taskTimeoutMs', 'retryOnRevise', 'maxAttempts', 'childTimeoutMs',
   'requiredCriteria', 'executorTools', 'verifierTools',
 ])
@@ -453,19 +468,30 @@ function exactConfigObject(value, keys, label) {
 /** Reject fields the public configuration wire does not own before schema defaults can hide them. */
 export function assertExactDispatcherConfig(value) {
   const policy = exactConfigObject(value, POLICY_CONFIG_KEYS, 'dispatcher configuration')
-  const lanes = exactConfigObject(policy.lanes, new Set(Object.keys(policy.lanes ?? {})), 'dispatcher lanes')
+  const lanes = policy.lanes === undefined
+    ? {}
+    : exactConfigObject(policy.lanes, new Set(Object.keys(policy.lanes)), 'dispatcher lanes')
   for (const [id, laneValue] of Object.entries(lanes)) {
     const lane = exactConfigObject(laneValue, LANE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)}`)
-    exactConfigObject(lane.execution, EXECUTION_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} execution`)
-    exactConfigObject(
-      lane.orchestration,
-      ORCHESTRATION_CONFIG_KEYS,
-      `dispatcher lane ${JSON.stringify(id)} orchestration`,
-    )
+    if (lane.execution !== undefined) {
+      exactConfigObject(lane.execution, EXECUTION_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} execution`)
+    }
+    if (lane.orchestration !== undefined) {
+      exactConfigObject(
+        lane.orchestration,
+        ORCHESTRATION_CONFIG_KEYS,
+        `dispatcher lane ${JSON.stringify(id)} orchestration`,
+      )
+    }
     exactConfigObject(lane.executor, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} executor`)
     exactConfigObject(lane.verifier, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} verifier`)
     if (lane.planner !== undefined) {
       exactConfigObject(lane.planner, ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} planner`)
+    }
+    for (const role of ['planReviewer', 'replanner', 'finalVerifier']) {
+      if (lane[role] !== undefined) {
+        exactConfigObject(lane[role], ROUTE_CONFIG_KEYS, `dispatcher lane ${JSON.stringify(id)} ${role}`)
+      }
     }
     if (Array.isArray(lane.requiredCriteria)) {
       lane.requiredCriteria.forEach((criterion, index) => {
@@ -477,16 +503,20 @@ export function assertExactDispatcherConfig(value) {
       })
     }
   }
-  const distribution = exactConfigObject(
-    policy.distribution,
-    DISTRIBUTION_CONFIG_KEYS,
-    'dispatcher distribution configuration',
-  )
-  exactConfigObject(
-    distribution.workspaceMappings,
-    new Set(Object.keys(distribution.workspaceMappings ?? {})),
-    'dispatcher distribution workspace mappings',
-  )
+  if (policy.distribution !== undefined) {
+    const distribution = exactConfigObject(
+      policy.distribution,
+      DISTRIBUTION_CONFIG_KEYS,
+      'dispatcher distribution configuration',
+    )
+    if (distribution.workspaceMappings !== undefined) {
+      exactConfigObject(
+        distribution.workspaceMappings,
+        new Set(Object.keys(distribution.workspaceMappings)),
+        'dispatcher distribution workspace mappings',
+      )
+    }
+  }
   return value
 }
 

@@ -9,6 +9,7 @@
 
 .page h2,
 .page h4,
+.page h5,
 .page p { margin: 0; }
 
 .page h2 { font-size: 18px; font-weight: 600; }
@@ -148,6 +149,62 @@ textarea.input { resize: vertical; }
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
 
+.modelsHead { display: grid; gap: 4px; }
+.modelsHead p { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+
+.modelScope {
+  display: grid;
+  gap: 4px;
+  padding: 10px 11px;
+  border-left: 3px solid var(--dsw-alias-brand-primary);
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.modelScope strong { font-size: 12px; }
+.modelScope p { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.5; }
+
+.roleGrid { display: flex; flex-direction: column; gap: 10px; }
+
+.roleCard {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  padding: 11px;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 9px;
+  background: var(--dsw-alias-bg-layer-3);
+}
+
+.roleCard[data-inactive='true'] { opacity: .68; }
+
+.roleHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.roleHead > div { min-width: 0; display: grid; gap: 3px; }
+.roleHead h5 { font-size: 13px; font-weight: 600; }
+.roleHead p { color: var(--dsw-alias-label-tertiary); font-size: 11px; line-height: 1.45; }
+
+.roleState { color: var(--dsw-alias-label-tertiary); font-size: 12px; line-height: 1.5; }
+
+.inheritedRoute {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 9px;
+  border-radius: 7px;
+  background: var(--dsw-alias-bg-layer-2);
+  font-size: 12px;
+}
+
+.inheritedRoute span { color: var(--dsw-alias-label-tertiary); }
+.inheritedRoute strong { min-width: 0; overflow-wrap: anywhere; }
+
 .route,
 .criterion {
   min-width: 0;
@@ -230,7 +287,8 @@ textarea.input { resize: vertical; }
 
 @media (max-width: 680px) {
   .pageHead,
-  .subhead { align-items: stretch; flex-direction: column; }
+  .subhead,
+  .roleHead { align-items: stretch; flex-direction: column; }
   .grid2,
   .grid3,
   .mapping,
@@ -240,6 +298,7 @@ textarea.input { resize: vertical; }
   .addLane > p { grid-column: auto; }
   .footer { flex-wrap: wrap; bottom: -24px; }
   .footerStatus { flex-basis: 100%; }
+  .inheritedRoute { align-items: flex-start; flex-direction: column; }
 }
 
 @media (prefers-reduced-motion: reduce) {

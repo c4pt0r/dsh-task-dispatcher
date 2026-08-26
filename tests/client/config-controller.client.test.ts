@@ -151,6 +151,23 @@ describe('validateDispatcherDraft', () => {
     })
   })
 
+  it('validates role-specific routes and requires a planner before any override', () => {
+    const config = configFixture()
+    const lane = config.lanes.analysis!
+    lane.planReviewer = { provider: 'review', model: '', maxTokens: 12_000 }
+    lane.replanner = { provider: 'planning', model: 'replan', maxTokens: 0 }
+    lane.finalVerifier = { provider: 'review', model: 'final', maxTokens: 12_000 }
+    lane.planner = undefined
+
+    expect(validateDispatcherDraft(config)).toMatchObject({
+      'lanes.analysis.planReviewer': 'planning-required',
+      'lanes.analysis.planReviewer.model': 'required',
+      'lanes.analysis.replanner': 'planning-required',
+      'lanes.analysis.replanner.maxTokens': 'range',
+      'lanes.analysis.finalVerifier': 'planning-required',
+    })
+  })
+
   it('rejects raw recursion and validates the first read-only orchestration mode', () => {
     const config = configFixture()
     config.lanes.leaf = structuredClone(config.lanes.analysis!)

@@ -7,7 +7,7 @@ describe('Task Dispatcher configuration decoder', () => {
     const wire = configSnapshot(7)
     const decoded = decodeDispatcherConfigSnapshot(wire)
     expect(decoded).toMatchObject({
-      protocolVersion: 1,
+      protocolVersion: 2,
       available: true,
       writable: true,
       applies: 'restart',
@@ -28,6 +28,28 @@ describe('Task Dispatcher configuration decoder', () => {
     const orchestration = configSnapshot()
     Object.assign(orchestration.value.lanes.analysis!.orchestration, { rawTool: 'workflow' })
     expect(() => decodeDispatcherConfigSnapshot(orchestration)).toThrow(/unexpected rawTool/u)
+  })
+
+  it('decodes and detaches the three optional role-specific model routes', () => {
+    const wire = configSnapshot()
+    const lane = wire.value.lanes.analysis!
+    lane.planReviewer = { provider: 'review-provider', model: 'plan-review', maxTokens: 9_000 }
+    lane.replanner = { provider: 'planning-provider', model: 'replan', maxTokens: 10_000 }
+    lane.finalVerifier = { provider: 'review-provider', model: 'final-review', maxTokens: 11_000 }
+
+    const decoded = decodeDispatcherConfigSnapshot(wire)
+    expect(decoded.value.lanes.analysis).toMatchObject({
+      planReviewer: { model: 'plan-review' },
+      replanner: { model: 'replan' },
+      finalVerifier: { model: 'final-review' },
+    })
+    lane.planReviewer.model = 'changed-after-decode'
+    expect(decoded.value.lanes.analysis?.planReviewer?.model).toBe('plan-review')
+  })
+
+  it('rejects the previous configuration protocol version', () => {
+    expect(() => decodeDispatcherConfigSnapshot({ ...configSnapshot(), protocolVersion: 1 }))
+      .toThrow(/protocolVersion must be 2/u)
   })
 
   it('uses the canonical base as a repair draft only when Host marks the stored candidate invalid', () => {

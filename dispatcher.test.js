@@ -78,6 +78,14 @@ function lane(overrides = {}) {
   }
 }
 
+function roleRoute(role, maxTokens) {
+  return {
+    provider: `${role}-provider`,
+    model: `${role}-model`,
+    maxTokens,
+  }
+}
+
 function macroTask(value) {
   const dependsOn = value.dependsOn ?? []
   return {
@@ -371,6 +379,18 @@ test('configuration resolves defaults and enforces cross-field policy', async (t
     },
   ]
 
+  for (const role of ['planReviewer', 'replanner', 'finalVerifier']) {
+    invalidCases.push({
+      name: `${role} route without planner`,
+      value: {
+        lanes: {
+          code: lane({ [role]: roleRoute(role, 4_000) }),
+        },
+      },
+      pattern: /role-specific planning routes require a planner/u,
+    })
+  }
+
   for (const example of invalidCases) {
     await t.test(example.name, () => {
       assert.throws(() => resolveDispatcherConfig(example.value), example.pattern)
@@ -514,19 +534,44 @@ test('configuration RPC is strict, restart-scoped, minimal, and revision fenced'
   const controller = createDispatcherConfigController(settings, base, { warn() {} })
   assert.deepEqual(controller.activeConfig(), resolveDispatcherConfig(base))
   const initial = controller.snapshot()
+  assert.equal(initial.protocolVersion, 2)
   assert.equal(initial.available, true)
   assert.equal(initial.applies, 'restart')
   assert.equal(initial.revision, 0)
   assert.deepEqual(initial.userLaneIds, [])
 
+  // User-created lanes saved before these nested policy objects existed stay
+  // editable; unknown nested keys are still rejected whenever the object is present.
+  user = { lanes: { legacy: lane({ executorTools: ['read'], verifierTools: ['read'] }) } }
+  effective = freeze(merge(base, user))
+  const legacy = controller.snapshot()
+  assert.equal(legacy.invalid, undefined)
+  assert.equal(legacy.value.lanes.legacy.execution.mode, 'local')
+  assert.equal(legacy.value.lanes.legacy.orchestration.enabled, false)
+  assert.deepEqual(legacy.userLaneIds, ['legacy'])
+  user = {}
+  effective = freeze(structuredClone(base))
+
   const changed = structuredClone(base)
   changed.maxConsecutiveFailures = 7
   changed.lanes.code.executor.model = 'executor-model-v2'
+  changed.lanes.code.planner = roleRoute('planner', 7_001)
+  changed.lanes.code.planReviewer = roleRoute('plan-reviewer', 7_002)
+  changed.lanes.code.replanner = roleRoute('replanner', 7_003)
+  changed.lanes.code.finalVerifier = roleRoute('final-verifier', 7_004)
   changed.lanes.review = structuredClone(base.lanes.code)
   changed.lanes.review.name = 'User review lane'
   const saved = await controller.save(changed, 0)
+  assert.equal(saved.protocolVersion, 2)
   assert.equal(saved.revision, 1)
-  assert.deepEqual(user.lanes.code, { executor: { model: 'executor-model-v2' } })
+  assert.deepEqual(user.lanes.code, {
+    executor: { model: 'executor-model-v2' },
+    planner: changed.lanes.code.planner,
+    planReviewer: changed.lanes.code.planReviewer,
+    replanner: changed.lanes.code.replanner,
+    finalVerifier: changed.lanes.code.finalVerifier,
+  })
+  assert.deepEqual(saved.value.lanes.code, changed.lanes.code)
   assert.deepEqual(user.lanes.review, changed.lanes.review)
   assert.equal(user.maxConsecutiveFailures, 7)
   assert.deepEqual(saved.userLaneIds, ['review'])
@@ -534,7 +579,19 @@ test('configuration RPC is strict, restart-scoped, minimal, and revision fenced'
   const handler = createDispatcherConfigRpcHandler(controller)
   const read = await handler('snapshot', {})
   assert.equal(read.ok, true)
+  assert.equal(read.value.protocolVersion, 2)
   assert.equal(read.value.value.lanes.code.executor.model, 'executor-model-v2')
+  assert.deepEqual({
+    planner: read.value.value.lanes.code.planner,
+    planReviewer: read.value.value.lanes.code.planReviewer,
+    replanner: read.value.value.lanes.code.replanner,
+    finalVerifier: read.value.value.lanes.code.finalVerifier,
+  }, {
+    planner: changed.lanes.code.planner,
+    planReviewer: changed.lanes.code.planReviewer,
+    replanner: changed.lanes.code.replanner,
+    finalVerifier: changed.lanes.code.finalVerifier,
+  })
   const stale = await handler('save', { expectedRevision: 0, value: changed })
   assert.deepEqual(stale, {
     ok: false,
@@ -570,6 +627,9 @@ test('configuration RPC is strict, restart-scoped, minimal, and revision fenced'
   delete removedBaseLane.lanes.code
   assert.throws(() => dispatcherConfigOverride(removedBaseLane, base), /deployment-owned/u)
   assert.throws(() => assertExactDispatcherConfig({ ...changed, unknown: true }), /unknown field/u)
+  const nestedExtra = structuredClone(changed)
+  nestedExtra.lanes.code.planReviewer.temperature = 0
+  assert.throws(() => assertExactDispatcherConfig(nestedExtra), /unknown field "temperature"/u)
 })
 
 test('configuration RPC stays unavailable without Settings and never exposes an environment value', async () => {
@@ -602,13 +662,23 @@ test('distributed lanes are explicitly read-only, spawn-only, and policy pinned'
         executorTools: ['read', 'grep'],
         verifierTools: ['read'],
         plannerTools: ['glob'],
+        planner: roleRoute('distributed-planner', 8_000),
         execution: { mode: 'distributed', pool: 'ds4-readonly', workspaceRef: 'harness-main' },
       }),
     },
   })
   assert.equal(distributed.lanes.remote.execution.mode, 'distributed')
   assert.equal(distributed.lanes.remote.execution.pool, 'ds4-readonly')
-  assert.match(distributedLanePolicyDigest('remote', distributed.lanes.remote), /^[a-f0-9]{64}$/u)
+  const baseDigest = distributedLanePolicyDigest('remote', distributed.lanes.remote)
+  assert.match(baseDigest, /^[a-f0-9]{64}$/u)
+  for (const [role, route] of [
+    ['planReviewer', roleRoute('distributed-plan-reviewer', 8_001)],
+    ['replanner', roleRoute('distributed-replanner', 8_002)],
+    ['finalVerifier', roleRoute('distributed-final-verifier', 8_003)],
+  ]) {
+    const roleSpecificLane = { ...distributed.lanes.remote, [role]: route }
+    assert.notEqual(distributedLanePolicyDigest('remote', roleSpecificLane), baseDigest)
+  }
 
   assert.throws(() => resolveDispatcherConfig({
     distribution: { role: 'coordinator' },
@@ -2462,7 +2532,7 @@ test('runTaskPipeline does not retry reject and never rejects on unexpected prom
   assert.equal(contained.modelVerified, false)
 })
 
-test('adaptive master plan runs two steps with an intervening keep decision and a final verifier', async () => {
+test('legacy three-route master plan preserves planner and verifier fallbacks across all six roles', async () => {
   const spec = plannedPipelineSpec()
   const children = [
     childRun('planner-initial', twoStepPlan()),
@@ -2539,7 +2609,12 @@ test('adaptive master plan runs two steps with an intervening keep decision and 
   assert.strictEqual(calls[2].request.agentOptions, spec.lane.executor)
   assert.strictEqual(calls[5].request.agentOptions, spec.lane.executor)
   assert.strictEqual(calls[1].request.agentOptions, spec.lane.verifier)
+  assert.strictEqual(calls[3].request.agentOptions, spec.lane.verifier)
+  assert.strictEqual(calls[6].request.agentOptions, spec.lane.verifier)
   assert.strictEqual(calls[7].request.agentOptions, spec.lane.verifier)
+  assert.equal(spec.lane.planReviewer, undefined)
+  assert.equal(spec.lane.replanner, undefined)
+  assert.equal(spec.lane.finalVerifier, undefined)
   assert.match(calls[2].request.prompt[0].text, /"id": "inspect"/u)
   assert.match(calls[5].request.prompt[0].text, /"id": "implement"/u)
 
@@ -2663,8 +2738,14 @@ test('master-plan telemetry failures never change an accepted pipeline result', 
   for (const child of children) assert.equal(child.disposals(), 1)
 })
 
-test('adaptive replanning replaces only the pending suffix before executing the replacement', async () => {
-  const spec = plannedPipelineSpec()
+test('adaptive replanning routes all six roles through their distinct configured models', async () => {
+  const spec = plannedPipelineSpec({
+    lane: {
+      planReviewer: roleRoute('plan-reviewer', 4_322),
+      replanner: roleRoute('replanner', 4_323),
+      finalVerifier: roleRoute('final-verifier', 4_324),
+    },
+  })
   const replacement = planStep('repair', { deliverableIds: ['code'] })
   const children = [
     childRun('planner-initial', twoStepPlan()),
@@ -2715,6 +2796,20 @@ test('adaptive replanning replaces only the pending suffix before executing the 
     `${spec.title} / repair verifier 1`,
     `${spec.title} / final verifier`,
   ])
+  const expectedRoutes = [
+    spec.lane.planner,
+    spec.lane.planReviewer,
+    spec.lane.executor,
+    spec.lane.verifier,
+    spec.lane.replanner,
+    spec.lane.planReviewer,
+    spec.lane.executor,
+    spec.lane.verifier,
+    spec.lane.finalVerifier,
+  ]
+  calls.forEach((call, index) => {
+    assert.strictEqual(call.agentOptions, expectedRoutes[index], `wrong route for ${call.label}`)
+  })
   assert.equal(calls.some(call => /implement executor/u.test(call.label)), false)
   assert.deepEqual(result.masterPlan.steps.map(step => [step.id, step.status]), [
     ['inspect', 'completed'],
@@ -5163,6 +5258,8 @@ test('rolling admission reaches a bounded replan checkpoint instead of starving 
 
 test('Host orchestration dynamically replaces only the pending DAG after a settled wave', async () => {
   const childLane = lane({
+    executor: roleRoute('child-executor', 9_001),
+    verifier: roleRoute('child-verifier', 9_002),
     executorTools: ['read'],
     plannerTools: [],
     verifierTools: ['read'],
@@ -5174,10 +5271,15 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
     lanes: {
       child: childLane,
       root: lane({
+        executor: roleRoute('root-unused-executor', 9_003),
+        verifier: roleRoute('root-verifier-fallback', 9_004),
         executorTools: ['read'],
         plannerTools: ['read'],
         verifierTools: ['read'],
-        planner: { provider: 'planner-provider', model: 'planner-model', maxTokens: 8_000 },
+        planner: roleRoute('root-planner', 9_005),
+        planReviewer: roleRoute('root-plan-reviewer', 9_006),
+        replanner: roleRoute('root-replanner', 9_007),
+        finalVerifier: roleRoute('root-final-verifier', 9_008),
         maxPlanPatches: 2,
         orchestration: {
           enabled: true,
@@ -5240,6 +5342,7 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
     })],
   }
   const labels = []
+  const requests = []
   let crossCheckExecutorPrompt = ''
   let sequence = 0
   const immediate = structured => childRun(`dynamic-${++sequence}`, structured).run
@@ -5248,6 +5351,7 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
     subagents: {
       start(_transport, request) {
         labels.push(request.label)
+        requests.push(request)
         switch (request.label) {
           case 'Adaptive orchestration root / orchestration planner': return immediate(initial)
           case 'Adaptive orchestration root / orchestration plan review': return immediate(planReviewReport())
@@ -5290,6 +5394,33 @@ test('Host orchestration dynamically replaces only the pending DAG after a settl
   telemetry.finishTask(spec.taskId, result)
 
   assert.equal(result.status, 'accepted')
+  const requestFor = label => requests.find(request => request.label === label)
+  assert.strictEqual(
+    requestFor('Adaptive orchestration root / orchestration planner').agentOptions,
+    spec.lane.planner,
+  )
+  assert.strictEqual(
+    requestFor('Adaptive orchestration root / orchestration plan review').agentOptions,
+    spec.lane.planReviewer,
+  )
+  assert.strictEqual(
+    requestFor('Adaptive orchestration root / orchestration replanner 2').agentOptions,
+    spec.lane.replanner,
+  )
+  assert.strictEqual(
+    requestFor('Adaptive orchestration root / orchestration patch review 2').agentOptions,
+    spec.lane.planReviewer,
+  )
+  assert.strictEqual(
+    requestFor('Adaptive orchestration root / orchestration final verifier').agentOptions,
+    spec.lane.finalVerifier,
+  )
+  assert.deepEqual(requestFor('Probe evidence / executor 1').agentOptions, configured.lanes.child.executor)
+  assert.deepEqual(requestFor('Probe evidence / verifier 1').agentOptions, configured.lanes.child.verifier)
+  assert.deepEqual(requestFor('Evidence cross-check / executor 1').agentOptions, configured.lanes.child.executor)
+  assert.deepEqual(requestFor('Evidence cross-check / verifier 1').agentOptions, configured.lanes.child.verifier)
+  assert.equal(requests.some(request => request.agentOptions === spec.lane.executor), false)
+  assert.equal(requests.some(request => request.agentOptions === spec.lane.verifier), false)
   assert.equal(result.masterPlan.patchCount, 1)
   assert.deepEqual(result.masterPlan.steps.map(step => [step.id, step.status, step.dependsOn]), [
     ['probe', 'completed', []],
